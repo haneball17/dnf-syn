@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.1.11312.151 d18.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DNFSyncBox", "DNFSyncBox.csproj", "{4A332585-C4E9-E4A6-E005-0221D1A3953C}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{4A332585-C4E9-E4A6-E005-0221D1A3953C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{4A332585-C4E9-E4A6-E005-0221D1A3953C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{4A332585-C4E9-E4A6-E005-0221D1A3953C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{4A332585-C4E9-E4A6-E005-0221D1A3953C}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {CE635614-553F-4F66-AFE6-98BDA25DE435}
+	EndGlobalSection
+EndGlobal

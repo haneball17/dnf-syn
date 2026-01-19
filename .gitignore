@@ -1,0 +1,42 @@
+# Visual Studio / .NET 构建产物
+.vs/
+[Bb]in/
+[Oo]bj/
+
+# Visual Studio 用户文件
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+*.pidb
+*.pdb
+*.mdb
+
+# 证书与密钥（如需保留请单独处理）
+*.pfx
+*.snk
+
+# NuGet 包
+*.nupkg
+*.snupkg
+
+# 测试与发布
+TestResults/
+publish/
+
+# JetBrains Rider
+.idea/
+*.sln.iml
+
+# VS Code（保留常用配置）
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# 系统文件
+.DS_Store
+Thumbs.db

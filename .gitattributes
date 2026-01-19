@@ -1,0 +1,24 @@
+# 统一文本文件行尾为 LF，避免跨平台差异
+* text=auto eol=lf
+
+# 明确的文本类型
+*.cs text
+*.xaml text
+*.csproj text
+*.json text
+*.md text
+*.yml text
+*.yaml text
+*.config text
+*.manifest text
+*.txt text
+
+# 二进制文件
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.exe binary
+*.dll binary
