@@ -230,6 +230,36 @@ static readonly HashSet<Keys> Blacklist = new()
   - 可热更新项：`syncMode`、`whitelists`、`allowSystemKeys`。
   - 需重启项：全局热键、窗口过滤策略等与钩子生命周期强相关的配置。
 
+**配置加载器方案（采用方案 B：分层合并 + 热更新）：**
+- 启动时分层加载并合并，运行中使用 `FileSystemWatcher` 监听配置变更。
+- 变更后先做校验；校验失败则回滚到上次有效配置，并记录告警日志。
+- 通过 500ms 防抖避免短时间内重复触发导致的抖动。
+
+**配置加载器伪代码流程：**
+```text
+LoadConfig():
+  defaults = BuildDefaults()
+  appData = TryReadJson(appDataPath)
+  portable = TryReadJson(portablePath)
+
+  merged = Merge(defaults, appData)
+  merged = Merge(merged, portable)
+
+  if !Validate(merged):
+      LogWarn("配置非法，回退上次有效配置")
+      return lastKnownGood ?? defaults
+
+  lastKnownGood = merged
+  return merged
+
+StartWatch():
+  Watch(configPath, debounce=500ms)
+  OnChange:
+    candidate = LoadConfig()
+    if candidate != lastKnownGood:
+        ApplyHotReload(candidate)
+```
+
 **配置字段完整清单：**
 - `configVersion`：整数，配置版本号，用于迁移（默认 `1`）。
 - `syncMode`：字符串，`Direction`/`Enhanced`/`Custom`（默认 `Enhanced`）。
