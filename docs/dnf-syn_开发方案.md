@@ -514,3 +514,22 @@ public static class NativeMethods
 - 集成验证：
   - 多窗口切换与暂停行为
   - 非 DNF 前台立即暂停
+
+---
+
+## 9. 消息欺骗技术验证（新增）
+
+为确认 DNF 实际输入路径，新增最小验证组件（不改主流程，仅用于实验验证）：
+
+- **DNFSyncBox.Agent**：进程内代理，钩 `GetAsyncKeyState` 与 DirectInput 关键调用，记录调用频次并可伪造方向键状态。
+- **DNFSyncBox.Injector**：注入器，发现 `dnf.exe` 并执行注入，通过命名管道发送测试指令。
+
+**验证步骤（Windows 环境，需 .NET Framework 4.8 目标包）：**
+
+1. 构建：`dotnet build "src/DNFSyncBox.Agent/DNFSyncBox.Agent.csproj"`
+2. 构建：`dotnet build "src/DNFSyncBox.Injector/DNFSyncBox.Injector.csproj"`
+3. 运行：`dotnet run --project "src/DNFSyncBox.Injector/DNFSyncBox.Injector.csproj"`
+   - 若提示未找到代理 DLL，可指定路径：`--agent "E:/code/dnf-syn/src/DNFSyncBox.Agent/bin/Debug/net48/DNFSyncBox.Agent.dll"`
+4. 观察 `stats` 输出判断输入路径（GetAsyncKeyState vs DirectInput）。
+
+**日志输出：** `%AppData%/DNFSyncBox/logs/agent-<pid>.log`。

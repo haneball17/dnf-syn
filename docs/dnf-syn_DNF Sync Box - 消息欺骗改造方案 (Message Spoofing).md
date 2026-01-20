@@ -1,165 +1,84 @@
-# DNF Sync Box - 消息欺骗改造方案（Message Spoofing）
+# DNF Sync Box - 消息欺骗改造方案（技术验证版）
 
-**版本：** 0.1  
-**目标：** 在后台输入不响应（疑似 DirectInput / RawInput）情况下，建立可用的按键同步通道。  
-**范围：** 仅方向键同步 + `Alt + .` 暂停热键，保留“前台非 DNF 自动暂停并清键”。
+## 1. 目标
 
----
+在现有 WM_KEY* 投递无效的前提下，先确认 DNF 实际输入路径：
 
-## 1. 背景与问题
+- 是否频繁调用 `GetAsyncKeyState`
+- 是否使用 DirectInput（`DirectInput8Create` / `GetDeviceState`）
 
-现有实现基于 `WM_KEYDOWN/WM_KEYUP` 与线程消息投递。日志显示“投递成功但无响应”，高度符合 DNF 使用 DirectInput/RawInput 的输入路径。  
-**结论：** 需要在目标进程内“就地欺骗”其输入读取结果，而不是依赖窗口消息。
+仅做**最小可验证**：能统计调用频率，必要时可伪造方向键以观察游戏响应。
 
 ---
 
-## 2. 方案澄清（什么是“消息欺骗”）
+## 2. 组件与职责
 
-“消息欺骗”在此指**在目标进程内拦截输入读取 API**，将我们构造的按键状态注入其读取结果，使游戏认为按键来自真实设备。  
-这不是简单的 `PostMessage`，而是 **Input Path Spoofing**（输入路径欺骗）。
+- **DNFSyncBox.Agent**（进程内代理）
+  - 注入到 DNF 进程中，钩住输入相关 API。
+  - 记录调用次数，并支持方向键伪造（可开关）。
+  - 日志输出：`%AppData%/DNFSyncBox/logs/agent-<pid>.log`。
 
----
-
-## 3. 总体架构
-
-### 3.1 组件划分
-
-1. **主控进程（DNFSyncBox）**
-   - 继续使用全局键盘钩子捕获前台方向键。
-   - 新增 **InjectionController**：为每个 DNF 进程注入代理 DLL，并建立 IPC 通道。
-   - 新增 **InputRouter**：将方向键事件路由到对应进程的代理。
-
-2. **进程内代理（InputSpoofAgent.dll）**
-   - 运行在 DNF 进程内，维护方向键状态。
-   - 钩住目标输入 API，返回“伪造”的按键状态。
-   - 与主控进程通过 IPC 同步按键事件与清键命令。
-
-### 3.2 数据流概览
-
-前台键盘事件 → 主控进程过滤/暂停判断 → IPC 下发 → 进程内代理更新键状态 → 目标 API 返回伪造状态 → 游戏响应。
+- **DNFSyncBox.Injector**（注入器）
+  - 发现 `dnf.exe` 进程并执行注入。
+  - 通过命名管道发送命令（按下/抬起/清键/统计）。
 
 ---
 
-## 4. 输入路径适配策略（核心）
+## 3. 技术要点（最小钩子集合）
 
-按 DNF 常见输入路径，采用**分层适配**：
+1. **GetAsyncKeyState**
+   - 目的：判断 DNF 是否走传统键盘状态 API。
+   - 处理：统计调用次数；若启用伪造，叠加方向键“按下”状态。
 
-1. **DirectInput（优先）**
-   - 钩点：`IDirectInputDevice8::GetDeviceState` / `GetDeviceData`。
-   - 方案：代理维护 256 键位数组；当方向键为 Down 时，对应字节置 `0x80`。
-   - **优势：** 覆盖大量老游戏输入路径，稳定且性能好。
+2. **DirectInput**
+   - `DirectInput8Create`：确认是否初始化 DirectInput。
+   - `IDirectInput8::CreateDevice`：捕获键盘设备创建。
+   - `IDirectInputDevice8::GetDeviceState`：统计调用并在需要时叠加方向键状态。
 
-2. **RawInput（次选）**
-   - 钩点：`GetRawInputData` / `GetRawInputBuffer`。
-   - 方案：当检测到 `WM_INPUT` 时返回伪造的 `RAWINPUT`。
-   - **优势：** 覆盖现代输入路径；兼容窗口不在前台时的输入读取。
-
-3. **传统键盘状态 API（兜底）**
-   - 钩点：`GetAsyncKeyState` / `GetKeyState`。
-   - 方案：返回方向键的伪造状态位。
-   - **优势：** 简单可靠，可作为最后保障。
-
-**说明：** 多路径同时开启时，按调用计数自动推断“真实路径”。日志记录调用频次，便于诊断。
+**判定原则：**
+- `GetAsyncKeyState` 调用密集 → 传统键盘状态路径。
+- `GetDeviceState` 调用密集 → DirectInput 路径。
+- 两者同时密集 → 混合或兼容路径。
 
 ---
 
-## 5. IPC 设计（主进程 ↔ 代理）
+## 4. 验证流程
 
-### 5.1 通道选择
-- **命名管道（Named Pipe）**：易用、可靠，事件量小（仅方向键）。
-- 每个目标进程一个通道：`DNFSyncBox.Agent.{pid}`。
+1. 构建项目（Windows 环境，需 .NET Framework 4.8 目标包）：
+   - `dotnet build "src/DNFSyncBox.Agent/DNFSyncBox.Agent.csproj"`
+   - `dotnet build "src/DNFSyncBox.Injector/DNFSyncBox.Injector.csproj"`
 
-### 5.2 消息格式（二进制）
+2. 以管理员启动注入器：
+   - `dotnet run --project "src/DNFSyncBox.Injector/DNFSyncBox.Injector.csproj"`
+   - 若提示未找到代理 DLL，可指定路径：`--agent "E:/code/dnf-syn/src/DNFSyncBox.Agent/bin/Debug/net48/DNFSyncBox.Agent.dll"`
 
-```text
-struct InputEvent {
-  uint32 type;   // 1=KeyDown 2=KeyUp 3=ClearAll 4=Pause 5=Resume
-  uint32 vk;     // 虚拟键码（方向键）
-  uint32 sc;     // 扫描码（可选，用于日志）
-  uint32 tick;   // 时间戳（可选，用于调试）
-}
-```
-
-### 5.3 关键原则
-- **低频高可靠**：方向键事件不多，优先保证稳定。
-- **强一致清键**：收到 `ClearAll` 后必须清空方向键状态。
+3. 常用指令：
+   - `stats`：查看输入路径调用统计
+   - `spoof on/off`：开启/关闭伪造输入
+   - `down up` / `up up`：模拟方向键按下/抬起（up/down/left/right）
+   - `clear`：清空方向键状态
+   - `stop`：让代理退出
 
 ---
 
-## 6. 关键流程
+## 5. 结果判断
 
-### 6.1 启动流程
-1. 主进程启动 → 校验管理员权限。
-2. 扫描 DNF 窗口 → 获取 PID → 注入代理。
-3. 建立 IPC → 代理返回握手信息（版本/架构/钩子状态）。
-
-### 6.2 同步流程
-1. 前台方向键事件 → `SyncController` 过滤。
-2. 若暂停或前台非 DNF → 不下发事件。
-3. 否则下发 `KeyDown/KeyUp` 到所有从控进程代理。
-
-### 6.3 暂停与清键
-- 手动暂停或前台非 DNF：立即下发 `ClearAll`，防止卡键。
-- 恢复时不自动补发按下事件（由用户重新按键）。
+- **仅 GetAsyncKeyState 明显增长**：优先走键盘状态 API。
+- **GetDeviceState 明显增长**：优先走 DirectInput。
+- **两者都增长**：可能混合使用或有兼容逻辑，后续需针对主路径继续欺骗。
 
 ---
 
-## 7. 与现有模块对接
+## 6. 风险与说明
 
-1. `SyncController`
-   - 保留热键逻辑与自动暂停判断。
-   - 将 `KeySender.PostKey` 替换为 `InputRouter.SendEvent`。
-   - 清键时改为向代理发送 `ClearAll`。
-
-2. `WindowManager`
-   - 现有窗口扫描保留；新增 PID 供注入器使用。
-
-3. `KeySender`
-   - 保留作为“降级方案”（仅在代理不可用时使用）。
+- **反作弊/安全软件**：注入与钩子可能被拦截，需具备降级方案。
+- **架构差异**：目标进程位数不同需匹配对应运行时与依赖。
+- **稳定性**：如发现崩溃，先关闭伪造输入，仅保留统计钩子。
 
 ---
 
-## 8. 诊断与日志
+## 7. 后续扩展方向（确认路径后再做）
 
-必须记录以下信息，便于定位“投递成功但无响应”的原因：
-
-- 目标进程 PID、窗口句柄、标题、类名。
-- 注入结果、代理版本、钩子安装状态。
-- 输入路径调用计数（DirectInput / RawInput / KeyState）。
-- IPC 事件数量、失败次数、延迟统计。
-
----
-
-## 9. 风险与对策
-
-1. **反作弊/安全软件阻拦**
-   - 对策：默认启用“可回退”模式；注入失败时自动降级为消息投递并提示。
-
-2. **架构不匹配（x86/x64）**
-   - 对策：同时提供 x86/x64 代理 DLL；注入前检测目标进程位数。
-
-3. **钩子导致崩溃**
-   - 对策：代理内部容错；钩子失败时返回原始函数结果并记录日志。
-
----
-
-## 10. 示例说明
-
-### 示例 A：DirectInput 路径
-- 你按住“上”键 → 主进程发送 `KeyDown(Up)`。
-- 代理将 `KeyState[Up]=0x80`。
-- DNF 调用 `GetDeviceState` → 返回带 `0x80` 的缓冲 → 角色持续上移。
-- 松开“上” → `KeyUp(Up)` → 状态清零。
-
-### 示例 B：前台非 DNF 自动暂停
-- 你切到浏览器 → 主进程检测前台非 DNF → 发送 `ClearAll`。
-- 代理立即清空方向键 → 角色停止移动，避免卡键与误操作。
-
----
-
-## 11. 方案优势（为什么这样做）
-
-- **与游戏输入路径对齐**：直接欺骗 DNF 的真实输入读取点，绕开后台消息失效问题。
-- **低延迟高稳定**：只同步方向键，数据量小，IPC 可靠。
-- **可诊断可回退**：保留消息投递作为降级方案，减少不可控风险。
-- **符合现有约束**：保持管理员权限、热键、自动暂停、清键等核心行为一致。
+- 针对真实路径完善输入伪造（RawInput 或 DirectInput）。
+- 将代理纳入主程序自动注入与同步控制流程。
+- 完善安全与异常恢复策略。
