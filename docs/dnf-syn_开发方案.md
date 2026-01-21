@@ -64,6 +64,20 @@
 4. 投递：构建 ScanCode `lParam` → `PostMessage` 到从控窗口。
 5. 暂停/恢复：切换状态 → 立即清键 → 更新 UI/日志。
 
+### 2.4 输入路径验证模块（dnfinput，原生 DLL）
+
+为验证 DNF 实际输入路径，新增 `dnfinput` 原生 DLL，
+通过 APC 注入后统计 Win32 / DirectInput / RawInput 的调用频率。
+
+关键要点：
+- 目录：`dnfinput/`，输出 `dnfinput.dll`（x86）
+- Hook 库：MinHook（已纳入 `dnfinput/third_party/`）
+- 日志：`%AppData%\\DNFSyncBox\\logs\\dnfinput_<pid>.log`
+
+构建命令（示例）：
+1. `cmake -S "dnfinput" -B "dnfinput/build" -A Win32`
+2. `cmake --build "dnfinput/build" --config Release`
+
 ---
 
 ## 3. 核心技术细节 (Deep Dive)

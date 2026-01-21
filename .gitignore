@@ -26,6 +26,34 @@
 TestResults/
 publish/
 
+# CMake / 原生构建产物
+build/
+**/build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CMakeUserPresets.json
+out/
+
+# 原生编译中间产物与输出
+*.obj
+*.o
+*.lib
+*.dll
+*.exe
+*.exp
+*.ilk
+*.ipdb
+*.iobj
+*.pch
+*.tlog
+*.lastbuildstate
+*.log
+
+# 第三方依赖（避免误提交嵌套仓库）
+dnfinput/third_party/minhook/.git/
+
 # JetBrains Rider
 .idea/
 *.sln.iml

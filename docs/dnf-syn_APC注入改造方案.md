@@ -11,7 +11,7 @@
 
 验证指标：
 - 不闪退（能进入游戏并保持稳定）
-- 日志能反映实际输入路径调用频率（GetAsyncKeyState / DirectInput）
+- 日志能反映实际输入路径调用频率（Win32 / DirectInput / RawInput）
 
 ---
 
@@ -73,22 +73,32 @@
 ### 4.1 统计目标
 
 - GetAsyncKeyState 调用次数
+- GetKeyboardState 调用次数（可选，用于确认 Win32 路径）
 - DirectInput8Create 调用次数
+- IDirectInput8::CreateDevice 调用次数 + 设备 GUID（用于确认是否键盘设备）
 - IDirectInputDevice8::GetDeviceState 调用次数
+- IDirectInputDevice8::GetDeviceData 调用次数
+- IDirectInputDevice8::Acquire / Poll / Unacquire 调用次数
+- RawInput：RegisterRawInputDevices / GetRawInputData 调用次数（可选）
 
 判定规则：
-- GetAsyncKeyState 频繁 -> 传统键盘状态路径
-- GetDeviceState 频繁 -> DirectInput 路径
-- 两者同时高频 -> 混合路径
+- GetAsyncKeyState 或 GetKeyboardState 频繁 -> 传统键盘状态路径
+- GetDeviceState 频繁 -> DirectInput 即时状态路径
+- GetDeviceData 频繁 -> DirectInput 缓冲路径
+- RawInput 相关函数频繁 -> RawInput 路径
+- 多项同时高频 -> 混合路径
 
 ### 4.2 实现方式
 
-- Hook GetAsyncKeyState：仅统计次数，不影响原逻辑
-- Hook DirectInput8Create：统计并进一步 Hook CreateDevice / GetDeviceState
+- Hook GetAsyncKeyState / GetKeyboardState：仅统计次数，不影响原逻辑
+- Hook DirectInput8Create：统计并进一步 Hook CreateDevice / GetDeviceState / GetDeviceData
+- 在 CreateDevice 中记录设备 GUID，用于区分 GUID_SysKeyboard
+- 统计 Acquire / Poll / Unacquire 调用频率，辅助判断是否在轮询设备
+- 可选 Hook RegisterRawInputDevices / GetRawInputData：排除 RawInput 路径干扰
 - 统计结果写入日志文件（建议 %AppData%/DNFSyncBox/logs/）
 
 示例：
-- 如果日志显示 GetDeviceState 每秒上百次，说明 DNF 以 DirectInput 为主。
+- 如果日志显示 GetDeviceState 或 GetDeviceData 每秒上百次，说明 DNF 以 DirectInput 为主。
 
 ---
 
@@ -123,4 +133,3 @@
 
 - 若验证通过，确认真实输入路径后再扩展伪造逻辑。
 - 若仍闪退，需考虑 Manual Map 或线程劫持方案。
-
