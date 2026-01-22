@@ -106,6 +106,10 @@ public sealed class SyncController : IDisposable
 
         if (autoPausedChanged && autoPaused)
         {
+            if (!_sharedMemory.IsReady)
+            {
+                TryInitializeSharedMemory();
+            }
             // 自动暂停时先清键，避免卡键。
             ClearStuckKeys();
             Log("前台非 DNF，已自动暂停同步");
@@ -113,6 +117,12 @@ public sealed class SyncController : IDisposable
         else if (autoPausedChanged && !autoPaused)
         {
             Log("前台已回到 DNF，自动暂停解除");
+            if (!_sharedMemory.IsReady)
+            {
+                TryInitializeSharedMemory();
+            }
+            // 解除自动暂停后立即发布，避免等待心跳或按键事件。
+            PublishSnapshot(forceClear: false);
         }
 
         LogSnapshotIfNeeded(snapshot);
@@ -129,6 +139,12 @@ public sealed class SyncController : IDisposable
         {
             _userPaused = !_userPaused;
             isPausedNow = _userPaused;
+        }
+
+        // 确保共享内存就绪，避免暂停状态写入被延迟。
+        if (!_sharedMemory.IsReady)
+        {
+            TryInitializeSharedMemory();
         }
 
         if (isPausedNow)

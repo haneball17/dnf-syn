@@ -33,8 +33,8 @@
   - 理由：便于制作悬浮状态窗与主面板。
 - 底层交互：Windows API (P/Invoke)
   - 核心库：`user32.dll`
-  - 核心机制：共享内存 + Win32/DirectInput 伪造（`GetAsyncKeyState` /
-    `GetKeyboardState` / `GetDeviceState`）
+  - 核心机制：共享内存 + Win32/DirectInput/RawInput 伪造（`GetAsyncKeyState` /
+    `GetKeyboardState` / `GetDeviceState` / `GetRawInputData` / `GetRawInputBuffer`）
 
 ### 2.2 模块划分
 1. UI 层（View）
@@ -62,14 +62,14 @@
 3. 按键捕获：钩子回调 → 更新键盘状态与边沿计数 → 套用方案掩码。
 4. 共享内存：写入快照（seq 无锁一致性）并持续心跳。
 5. 后台伪造：dnfinput Hook `GetAsyncKeyState` / `GetKeyboardState` /
-   `GetDeviceState` 并返回伪造状态。
+   `GetDeviceState` / `GetRawInputData` / `GetRawInputBuffer` 并返回伪造状态。
    - 若检测到后台丢弃输入，则启用前台欺骗（仅后台、未暂停时生效）。
 6. 暂停/恢复：触发清键与暂停标志 → 更新 UI/日志。
 
 ### 2.4 伪造输入模块（dnfinput，原生 DLL）
 
 `dnfinput.dll` 作为被注入模块，负责 Hook `GetAsyncKeyState`/`GetKeyboardState`/
-`GetDeviceState`，
+`GetDeviceState` / `GetRawInputData` / `GetRawInputBuffer`，
 读取共享内存快照并按方案伪造返回，同时记录调用统计与伪造命中率。
 
 关键要点：
@@ -102,7 +102,15 @@
 - vKey → DIK 使用 `MapVirtualKeyW(MAPVK_VK_TO_VSC_EX)` 映射，扩展键补 `0x80`。
 - 失联/暂停时对目标键强制清零，避免后台卡键。
 
-### 3.1.2 前台欺骗（Focus Spoof）
+### 3.1.2 RawInput（GetRawInputData / GetRawInputBuffer）伪造语义
+
+- 仅处理键盘 RawInput（`RIM_TYPEKEYBOARD`），避免影响鼠标/其他 HID。
+- 读取共享内存快照，根据 `targetMask` 与 `keyboardState` 重写 RawInput
+  中的 `VKey / MakeCode / Flags`，并设置对应的 `WM_KEYDOWN/WM_KEYUP`。
+- 暂停或失联时对目标键输出抬起（Break），避免后台卡键或继续响应。
+- Mapping 模式使用目标键序列重写事件，确保源键映射到目标键后仍能生效。
+
+### 3.1.3 前台欺骗（Focus Spoof）
 
 - Hook `GetForegroundWindow` / `GetActiveWindow` / `GetFocus`，让后台进程在
   读取窗口焦点时返回自身主窗口句柄。

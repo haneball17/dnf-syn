@@ -38,6 +38,7 @@ static volatile LONG g_countPoll = 0;
 static volatile LONG g_countUnacquire = 0;
 static volatile LONG g_countRegisterRawInput = 0;
 static volatile LONG g_countGetRawInputData = 0;
+static volatile LONG g_countGetRawInputBuffer = 0;
 static volatile LONG g_countGetForegroundWindow = 0;
 static volatile LONG g_countGetActiveWindow = 0;
 static volatile LONG g_countGetFocus = 0;
@@ -55,6 +56,8 @@ static const uint32_t kSharedVersion = 1;
 static const uint32_t kFlagPaused = 0x1;
 static const uint32_t kFlagClear = 0x2;
 static const ULONGLONG kSharedTimeoutMs = 200;
+// 与控制端 KeyboardProfileMode 枚举保持一致（Mapping=3）。
+static const uint32_t kProfileModeMapping = 3;
 
 #pragma pack(push, 1)
 struct SharedKeyboardStateV1
@@ -92,12 +95,16 @@ static LONG g_sharedReadyLogged = 0;
 static LONG g_sharedErrorLogged = 0;
 static LONG g_sharedVersionLogged = 0;
 static uint32_t g_lastEdgeCounter[256] = {};
+static uint8_t g_lastRawKeyboardState[256] = {};
 static uint32_t g_lastProfileId = 0;
 static uint32_t g_lastProfileMode = 0;
 static uint32_t g_lastClearSeq = 0;
+static uint32_t g_lastRawClearSeq = 0;
 static volatile LONG g_countSpoofAsync = 0;
 static volatile LONG g_countSpoofKeyboard = 0;
 static volatile LONG g_countSpoofDeviceState = 0;
+static int g_rawScanCursor = 0;
+static LONG g_seenRawInputBuffer = 0;
 
 static int g_vkeyToDik[256] = {};
 static LONG g_vkeyMapReady = 0;
@@ -122,6 +129,9 @@ static RegisterRawInputDevices_t g_origRegisterRawInputDevices = nullptr;
 
 using GetRawInputData_t = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
 static GetRawInputData_t g_origGetRawInputData = nullptr;
+
+using GetRawInputBuffer_t = UINT(WINAPI*)(PRAWINPUT, PUINT, UINT);
+static GetRawInputBuffer_t g_origGetRawInputBuffer = nullptr;
 
 using GetForegroundWindow_t = HWND(WINAPI*)();
 static GetForegroundWindow_t g_origGetForegroundWindow = nullptr;
@@ -654,6 +664,124 @@ static void ApplyClearIfNeeded(const SharedSnapshot& snapshot)
     }
 }
 
+static void ApplyRawClearIfNeeded(const SharedSnapshot& snapshot)
+{
+    if ((snapshot.flags & kFlagClear) == 0)
+    {
+        return;
+    }
+
+    if (snapshot.seq == g_lastRawClearSeq)
+    {
+        return;
+    }
+
+    g_lastRawClearSeq = snapshot.seq;
+    // 清键时重置 RawInput 伪造态，避免后台出现卡键或残留按下。
+    memset(g_lastRawKeyboardState, 0, sizeof(g_lastRawKeyboardState));
+}
+
+static void BuildRawKeyboardEvent(int vKey, bool isDown, RAWKEYBOARD& keyboard)
+{
+    // MapVirtualKeyW 的扩展键会在高位标记，RawInput 需要 RI_KEY_E0/E1。
+    UINT scan = MapVirtualKeyW(static_cast<UINT>(vKey), MAPVK_VK_TO_VSC_EX);
+    USHORT flags = 0;
+    if ((scan & 0x100) != 0)
+    {
+        flags |= RI_KEY_E0;
+    }
+    if ((scan & 0x200) != 0)
+    {
+        flags |= RI_KEY_E1;
+    }
+    if (!isDown)
+    {
+        flags |= RI_KEY_BREAK;
+    }
+
+    keyboard.MakeCode = static_cast<USHORT>(scan & 0xFF);
+    keyboard.Flags = flags;
+    keyboard.Reserved = 0;
+    keyboard.VKey = static_cast<USHORT>(vKey);
+    keyboard.Message = isDown ? WM_KEYDOWN : WM_KEYUP;
+    keyboard.ExtraInformation = 0;
+}
+
+static bool TryPickMappingRawKey(
+    const SharedSnapshot& snapshot,
+    bool alive,
+    bool paused,
+    int* vKeyOut,
+    bool* isDownOut)
+{
+    if (!vKeyOut || !isDownOut)
+    {
+        return false;
+    }
+
+    const bool allowDown = alive && !paused;
+    int start = g_rawScanCursor & 0xFF;
+
+    // 优先发送目标键的状态变化（按下/抬起），避免丢失边沿。
+    for (int i = 0; i < 256; i++)
+    {
+        int idx = (start + i) & 0xFF;
+        if (snapshot.targetMask[idx] == 0)
+        {
+            continue;
+        }
+
+        bool desiredDown = allowDown && (snapshot.keyboardState[idx] & 0x80) != 0;
+        bool lastDown = (g_lastRawKeyboardState[idx] & 0x80) != 0;
+        if (desiredDown != lastDown)
+        {
+            g_lastRawKeyboardState[idx] = desiredDown ? 0x80 : 0x00;
+            g_rawScanCursor = (idx + 1) & 0xFF;
+            *vKeyOut = idx;
+            *isDownOut = desiredDown;
+            return true;
+        }
+    }
+
+    // 如果没有变化，复用一个仍处于按下状态的键，用于保持连续移动。
+    if (allowDown)
+    {
+        for (int i = 0; i < 256; i++)
+        {
+            int idx = (start + i) & 0xFF;
+            if (snapshot.targetMask[idx] == 0)
+            {
+                continue;
+            }
+
+            if ((snapshot.keyboardState[idx] & 0x80) != 0)
+            {
+                g_rawScanCursor = (idx + 1) & 0xFF;
+                *vKeyOut = idx;
+                *isDownOut = true;
+                return true;
+            }
+        }
+    }
+
+    // 没有可按下键时仍选择一个目标键输出抬起，避免真实输入穿透。
+    for (int i = 0; i < 256; i++)
+    {
+        int idx = (start + i) & 0xFF;
+        if (snapshot.targetMask[idx] == 0)
+        {
+            continue;
+        }
+
+        g_rawScanCursor = (idx + 1) & 0xFF;
+        *vKeyOut = idx;
+        *isDownOut = false;
+        return true;
+    }
+
+    return false;
+}
+
 static bool IsSnapshotAlive(const SharedSnapshot& snapshot)
 {
     if (snapshot.lastTick == 0)
@@ -971,6 +1099,96 @@ static BOOL WINAPI Hook_RegisterRawInputDevices(PCRAWINPUTDEVICE devices, UINT n
     return g_origRegisterRawInputDevices ? g_origRegisterRawInputDevices(devices, numDevices, size) : FALSE;
 }
 
+static UINT WINAPI Hook_GetRawInputBuffer(PRAWINPUT data, PUINT size, UINT headerSize)
+{
+    InterlockedIncrement(&g_countGetRawInputBuffer);
+    if (!g_origGetRawInputBuffer)
+    {
+        return 0;
+    }
+
+    UINT count = g_origGetRawInputBuffer(data, size, headerSize);
+    if (!data || !size || count == 0)
+    {
+        return count;
+    }
+
+    InterlockedExchange(&g_seenRawInputBuffer, 1);
+
+    SharedSnapshot snapshot = {};
+    const bool hasSnapshot = ReadSharedSnapshot(snapshot);
+    if (hasSnapshot)
+    {
+        ApplyClearIfNeeded(snapshot);
+        ApplyRawClearIfNeeded(snapshot);
+    }
+
+    RAWINPUT* raw = data;
+    for (UINT i = 0; i < count; i++)
+    {
+        if (raw->header.dwType == RIM_TYPEKEYBOARD &&
+            raw->header.dwSize >= sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD))
+        {
+            bool spoofed = false;
+            if (hasSnapshot && !IsBypassProcess(snapshot))
+            {
+                const bool alive = IsSnapshotAlive(snapshot);
+                const bool paused = (snapshot.flags & kFlagPaused) != 0;
+
+                if (snapshot.profileMode == kProfileModeMapping)
+                {
+                    // 映射模式下用目标键序列重写 RawInput，确保后台能收到映射后的按键事件。
+                    int vKey = 0;
+                    bool isDown = false;
+                    if (TryPickMappingRawKey(snapshot, alive, paused, &vKey, &isDown))
+                    {
+                        BuildRawKeyboardEvent(vKey, isDown, raw->data.keyboard);
+                        spoofed = true;
+                    }
+                }
+                else
+                {
+                    int vKey = static_cast<int>(raw->data.keyboard.VKey);
+                    if (vKey >= 0 && vKey < 256 && snapshot.targetMask[vKey] != 0)
+                    {
+                        if (!alive || paused)
+                        {
+                            // 暂停或失联时强制抬起，避免后台继续响应真实输入。
+                            g_lastRawKeyboardState[vKey] = 0;
+                            BuildRawKeyboardEvent(vKey, false, raw->data.keyboard);
+                            spoofed = true;
+                        }
+                    }
+                }
+            }
+
+            const RAWKEYBOARD& kb = raw->data.keyboard;
+            wchar_t buffer[256] = {0};
+            StringCchPrintfW(
+                buffer,
+                ARRAYSIZE(buffer),
+                L"[RAWB] %s RawInputBuffer 键盘: VKey=%u(0x%02X) MakeCode=%u(0x%02X) Flags=0x%X Spoof=%d",
+                GetTimestamp().c_str(),
+                kb.VKey,
+                kb.VKey,
+                kb.MakeCode,
+                kb.MakeCode,
+                kb.Flags,
+                spoofed ? 1 : 0);
+            WriteLogLine(buffer);
+        }
+
+        // 跳到下一个 RawInput 结构，防止异常尺寸导致死循环。
+        if (raw->header.dwSize == 0)
+        {
+            break;
+        }
+        raw = reinterpret_cast<RAWINPUT*>(reinterpret_cast<BYTE*>(raw) + raw->header.dwSize);
+    }
+
+    return count;
+}
+
 static UINT WINAPI Hook_GetRawInputData(HRAWINPUT hRawInput, UINT command, LPVOID data, PUINT size, UINT headerSize)
 {
     InterlockedIncrement(&g_countGetRawInputData);
@@ -981,24 +1199,71 @@ static UINT WINAPI Hook_GetRawInputData(HRAWINPUT hRawInput, UINT command, LPVOI
 
     UINT result = g_origGetRawInputData(hRawInput, command, data, size, headerSize);
 
-    // 仅记录键盘 RawInput，便于判定按键是否只通过 RawInput 进入 DNF。
-    if (result > 0 && command == RID_INPUT && data && size && *size >= sizeof(RAWINPUT))
+    // RawInput 键盘数据大小通常小于 sizeof(RAWINPUT)，必须以 header->dwSize 判定。
+    const bool allowDataSpoof = InterlockedCompareExchange(&g_seenRawInputBuffer, 1, 1) == 0;
+    if (result > 0 && command == RID_INPUT && data && size && *size >= sizeof(RAWINPUTHEADER))
     {
-        const RAWINPUT* raw = static_cast<const RAWINPUT*>(data);
-        if (raw->header.dwType == RIM_TYPEKEYBOARD)
+        auto* header = static_cast<RAWINPUTHEADER*>(data);
+        if (header->dwType == RIM_TYPEKEYBOARD &&
+            header->dwSize >= sizeof(RAWINPUTHEADER) + sizeof(RAWKEYBOARD) &&
+            result >= header->dwSize)
         {
+            auto* raw = static_cast<RAWINPUT*>(data);
+            SharedSnapshot snapshot = {};
+            bool spoofed = false;
+
+            if (ReadSharedSnapshot(snapshot))
+            {
+                ApplyClearIfNeeded(snapshot);
+                ApplyRawClearIfNeeded(snapshot);
+
+                if (!IsBypassProcess(snapshot))
+                {
+                    const bool alive = IsSnapshotAlive(snapshot);
+                    const bool paused = (snapshot.flags & kFlagPaused) != 0;
+
+                    if (allowDataSpoof && snapshot.profileMode == kProfileModeMapping)
+                    {
+                        // 映射模式下用目标键序列重写 RawInput，确保后台能收到映射后的按键事件。
+                        int vKey = 0;
+                        bool isDown = false;
+                        if (TryPickMappingRawKey(snapshot, alive, paused, &vKey, &isDown))
+                        {
+                            BuildRawKeyboardEvent(vKey, isDown, raw->data.keyboard);
+                            spoofed = true;
+                        }
+                    }
+                    else
+                    {
+                        // 非映射模式：仅在暂停/失联时强制抬起，避免吞掉真实输入。
+                        int vKey = static_cast<int>(raw->data.keyboard.VKey);
+                        if (vKey >= 0 && vKey < 256 && snapshot.targetMask[vKey] != 0)
+                        {
+                            if (!alive || paused)
+                            {
+                                g_lastRawKeyboardState[vKey] = 0;
+                                BuildRawKeyboardEvent(vKey, false, raw->data.keyboard);
+                                spoofed = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 仅记录键盘 RawInput，便于判定按键是否只通过 RawInput 进入 DNF。
             const RAWKEYBOARD& kb = raw->data.keyboard;
             wchar_t buffer[256] = {0};
             StringCchPrintfW(
                 buffer,
                 ARRAYSIZE(buffer),
-                L"[RAW] %s RawInput 键盘: VKey=%u(0x%02X) MakeCode=%u(0x%02X) Flags=0x%X",
+                L"[RAW] %s RawInput 键盘: VKey=%u(0x%02X) MakeCode=%u(0x%02X) Flags=0x%X Spoof=%d",
                 GetTimestamp().c_str(),
                 kb.VKey,
                 kb.VKey,
                 kb.MakeCode,
                 kb.MakeCode,
-                kb.Flags);
+                kb.Flags,
+                spoofed ? 1 : 0);
             WriteLogLine(buffer);
         }
     }
@@ -1376,6 +1641,17 @@ static void InstallUser32Hooks()
         }
     }
 
+    auto* rawBuffer = reinterpret_cast<LPVOID>(GetProcAddress(user32, "GetRawInputBuffer"));
+    if (rawBuffer)
+    {
+        MH_STATUS status = MH_CreateHook(rawBuffer, Hook_GetRawInputBuffer, reinterpret_cast<LPVOID*>(&g_origGetRawInputBuffer));
+        LogMinHookStatus(L"Hook GetRawInputBuffer", status);
+        if (status == MH_OK)
+        {
+            MH_EnableHook(rawBuffer);
+        }
+    }
+
     auto* getForeground = reinterpret_cast<LPVOID>(GetProcAddress(user32, "GetForegroundWindow"));
     if (getForeground)
     {
@@ -1456,6 +1732,7 @@ static void LogCountersOnce()
     LONG unacquire = InterlockedExchange(&g_countUnacquire, 0);
     LONG rawRegister = InterlockedExchange(&g_countRegisterRawInput, 0);
     LONG rawData = InterlockedExchange(&g_countGetRawInputData, 0);
+    LONG rawBuffer = InterlockedExchange(&g_countGetRawInputBuffer, 0);
     LONG getForeground = InterlockedExchange(&g_countGetForegroundWindow, 0);
     LONG getActive = InterlockedExchange(&g_countGetActiveWindow, 0);
     LONG getFocus = InterlockedExchange(&g_countGetFocus, 0);
@@ -1468,7 +1745,7 @@ static void LogCountersOnce()
     StringCchPrintfW(
         buffer,
         ARRAYSIZE(buffer),
-        L"[STAT] %s Win32: GetAsyncKeyState=%ld GetKeyboardState=%ld SpoofAsync=%ld SpoofKeyboard=%ld | Focus: Foreground=%ld Active=%ld Focus=%ld Spoof=%ld | DirectInput: DirectInput8Create=%ld CreateDevice=%ld GetDeviceState=%ld Fail=%ld NotAcquired=%ld GetDeviceData=%ld Acquire=%ld Poll=%ld Unacquire=%ld SpoofDI=%ld | RawInput: Register=%ld GetRawInputData=%ld | Profile=%lu Mode=%lu",
+        L"[STAT] %s Win32: GetAsyncKeyState=%ld GetKeyboardState=%ld SpoofAsync=%ld SpoofKeyboard=%ld | Focus: Foreground=%ld Active=%ld Focus=%ld Spoof=%ld | DirectInput: DirectInput8Create=%ld CreateDevice=%ld GetDeviceState=%ld Fail=%ld NotAcquired=%ld GetDeviceData=%ld Acquire=%ld Poll=%ld Unacquire=%ld SpoofDI=%ld | RawInput: Register=%ld GetRawInputData=%ld GetRawInputBuffer=%ld | Profile=%lu Mode=%lu",
         GetTimestamp().c_str(),
         getAsync,
         getKeyboard,
@@ -1490,6 +1767,7 @@ static void LogCountersOnce()
         spoofDeviceState,
         rawRegister,
         rawData,
+        rawBuffer,
         g_lastProfileId,
         g_lastProfileMode);
 
