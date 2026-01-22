@@ -39,6 +39,9 @@ static volatile LONG g_countUnacquire = 0;
 static volatile LONG g_countRegisterRawInput = 0;
 static volatile LONG g_countGetRawInputData = 0;
 static volatile LONG g_countGetRawInputBuffer = 0;
+static volatile LONG g_countGetMessage = 0;
+static volatile LONG g_countPeekMessage = 0;
+static volatile LONG g_countSpoofWmInput = 0;
 static volatile LONG g_countGetForegroundWindow = 0;
 static volatile LONG g_countGetActiveWindow = 0;
 static volatile LONG g_countGetFocus = 0;
@@ -132,6 +135,18 @@ static GetRawInputData_t g_origGetRawInputData = nullptr;
 
 using GetRawInputBuffer_t = UINT(WINAPI*)(PRAWINPUT, PUINT, UINT);
 static GetRawInputBuffer_t g_origGetRawInputBuffer = nullptr;
+
+using GetMessageW_t = BOOL(WINAPI*)(LPMSG, HWND, UINT, UINT);
+static GetMessageW_t g_origGetMessageW = nullptr;
+
+using GetMessageA_t = BOOL(WINAPI*)(LPMSG, HWND, UINT, UINT);
+static GetMessageA_t g_origGetMessageA = nullptr;
+
+using PeekMessageW_t = BOOL(WINAPI*)(LPMSG, HWND, UINT, UINT, UINT);
+static PeekMessageW_t g_origPeekMessageW = nullptr;
+
+using PeekMessageA_t = BOOL(WINAPI*)(LPMSG, HWND, UINT, UINT, UINT);
+static PeekMessageA_t g_origPeekMessageA = nullptr;
 
 using GetForegroundWindow_t = HWND(WINAPI*)();
 static GetForegroundWindow_t g_origGetForegroundWindow = nullptr;
@@ -971,6 +986,57 @@ static bool ShouldSpoofFocus()
     return true;
 }
 
+static bool IsKeyboardRawInputHandle(HRAWINPUT hRawInput)
+{
+    if (!g_origGetRawInputData || !hRawInput)
+    {
+        return false;
+    }
+
+    RAWINPUTHEADER header = {};
+    UINT size = sizeof(header);
+    UINT result = g_origGetRawInputData(hRawInput, RID_HEADER, &header, &size, sizeof(RAWINPUTHEADER));
+    if (result == 0 || size < sizeof(RAWINPUTHEADER))
+    {
+        return false;
+    }
+
+    return header.dwType == RIM_TYPEKEYBOARD;
+}
+
+static void FixWmInputMessage(MSG* msg)
+{
+    if (!msg)
+    {
+        return;
+    }
+
+    if (msg->message != WM_INPUT)
+    {
+        return;
+    }
+
+    if (msg->wParam != RIM_INPUTSINK)
+    {
+        return;
+    }
+
+    // 后台时将 RIM_INPUTSINK 改为 RIM_INPUT，避免客户端忽略后台 RawInput。
+    if (!ShouldSpoofFocus())
+    {
+        return;
+    }
+
+    HRAWINPUT hRawInput = reinterpret_cast<HRAWINPUT>(msg->lParam);
+    if (!IsKeyboardRawInputHandle(hRawInput))
+    {
+        return;
+    }
+
+    msg->wParam = RIM_INPUT;
+    InterlockedIncrement(&g_countSpoofWmInput);
+}
+
 // ------------------------------
 // Hook 回调
 // ------------------------------
@@ -1235,15 +1301,28 @@ static UINT WINAPI Hook_GetRawInputData(HRAWINPUT hRawInput, UINT command, LPVOI
                     }
                     else
                     {
-                        // 非映射模式：仅在暂停/失联时强制抬起，避免吞掉真实输入。
+                        // 非映射模式：仅对目标键按“期望状态”修正 Make/Break，避免吞键。
                         int vKey = static_cast<int>(raw->data.keyboard.VKey);
                         if (vKey >= 0 && vKey < 256 && snapshot.targetMask[vKey] != 0)
                         {
-                            if (!alive || paused)
+                            const bool desiredDown = alive && !paused && (snapshot.keyboardState[vKey] & 0x80) != 0;
+                            const bool rawDown = (raw->data.keyboard.Flags & RI_KEY_BREAK) == 0;
+
+                            if (allowDataSpoof)
                             {
-                                g_lastRawKeyboardState[vKey] = 0;
+                                if (desiredDown != rawDown)
+                                {
+                                    BuildRawKeyboardEvent(vKey, desiredDown, raw->data.keyboard);
+                                    spoofed = true;
+                                }
+                                g_lastRawKeyboardState[vKey] = desiredDown ? 0x80 : 0x00;
+                            }
+                            else if (!desiredDown && rawDown)
+                            {
+                                // 当 RawInputBuffer 已在使用时，只在暂停/失联时兜底抬起。
                                 BuildRawKeyboardEvent(vKey, false, raw->data.keyboard);
                                 spoofed = true;
+                                g_lastRawKeyboardState[vKey] = 0;
                             }
                         }
                     }
@@ -1266,6 +1345,74 @@ static UINT WINAPI Hook_GetRawInputData(HRAWINPUT hRawInput, UINT command, LPVOI
                 spoofed ? 1 : 0);
             WriteLogLine(buffer);
         }
+    }
+
+    return result;
+}
+
+static BOOL WINAPI Hook_GetMessageW(LPMSG msg, HWND hwnd, UINT min, UINT max)
+{
+    InterlockedIncrement(&g_countGetMessage);
+    if (!g_origGetMessageW)
+    {
+        return FALSE;
+    }
+
+    BOOL result = g_origGetMessageW(msg, hwnd, min, max);
+    if (result > 0 && msg)
+    {
+        FixWmInputMessage(msg);
+    }
+
+    return result;
+}
+
+static BOOL WINAPI Hook_GetMessageA(LPMSG msg, HWND hwnd, UINT min, UINT max)
+{
+    InterlockedIncrement(&g_countGetMessage);
+    if (!g_origGetMessageA)
+    {
+        return FALSE;
+    }
+
+    BOOL result = g_origGetMessageA(msg, hwnd, min, max);
+    if (result > 0 && msg)
+    {
+        FixWmInputMessage(msg);
+    }
+
+    return result;
+}
+
+static BOOL WINAPI Hook_PeekMessageW(LPMSG msg, HWND hwnd, UINT min, UINT max, UINT remove)
+{
+    InterlockedIncrement(&g_countPeekMessage);
+    if (!g_origPeekMessageW)
+    {
+        return FALSE;
+    }
+
+    BOOL result = g_origPeekMessageW(msg, hwnd, min, max, remove);
+    if (result && msg)
+    {
+        FixWmInputMessage(msg);
+    }
+
+    return result;
+}
+
+static BOOL WINAPI Hook_PeekMessageA(LPMSG msg, HWND hwnd, UINT min, UINT max, UINT remove)
+{
+    InterlockedIncrement(&g_countPeekMessage);
+    if (!g_origPeekMessageA)
+    {
+        return FALSE;
+    }
+
+    BOOL result = g_origPeekMessageA(msg, hwnd, min, max, remove);
+    if (result && msg)
+    {
+        FixWmInputMessage(msg);
     }
 
     return result;
@@ -1652,6 +1799,50 @@ static void InstallUser32Hooks()
         }
     }
 
+    auto* getMessageW = reinterpret_cast<LPVOID>(GetProcAddress(user32, "GetMessageW"));
+    if (getMessageW)
+    {
+        MH_STATUS status = MH_CreateHook(getMessageW, Hook_GetMessageW, reinterpret_cast<LPVOID*>(&g_origGetMessageW));
+        LogMinHookStatus(L"Hook GetMessageW", status);
+        if (status == MH_OK)
+        {
+            MH_EnableHook(getMessageW);
+        }
+    }
+
+    auto* getMessageA = reinterpret_cast<LPVOID>(GetProcAddress(user32, "GetMessageA"));
+    if (getMessageA)
+    {
+        MH_STATUS status = MH_CreateHook(getMessageA, Hook_GetMessageA, reinterpret_cast<LPVOID*>(&g_origGetMessageA));
+        LogMinHookStatus(L"Hook GetMessageA", status);
+        if (status == MH_OK)
+        {
+            MH_EnableHook(getMessageA);
+        }
+    }
+
+    auto* peekMessageW = reinterpret_cast<LPVOID>(GetProcAddress(user32, "PeekMessageW"));
+    if (peekMessageW)
+    {
+        MH_STATUS status = MH_CreateHook(peekMessageW, Hook_PeekMessageW, reinterpret_cast<LPVOID*>(&g_origPeekMessageW));
+        LogMinHookStatus(L"Hook PeekMessageW", status);
+        if (status == MH_OK)
+        {
+            MH_EnableHook(peekMessageW);
+        }
+    }
+
+    auto* peekMessageA = reinterpret_cast<LPVOID>(GetProcAddress(user32, "PeekMessageA"));
+    if (peekMessageA)
+    {
+        MH_STATUS status = MH_CreateHook(peekMessageA, Hook_PeekMessageA, reinterpret_cast<LPVOID*>(&g_origPeekMessageA));
+        LogMinHookStatus(L"Hook PeekMessageA", status);
+        if (status == MH_OK)
+        {
+            MH_EnableHook(peekMessageA);
+        }
+    }
+
     auto* getForeground = reinterpret_cast<LPVOID>(GetProcAddress(user32, "GetForegroundWindow"));
     if (getForeground)
     {
@@ -1733,6 +1924,9 @@ static void LogCountersOnce()
     LONG rawRegister = InterlockedExchange(&g_countRegisterRawInput, 0);
     LONG rawData = InterlockedExchange(&g_countGetRawInputData, 0);
     LONG rawBuffer = InterlockedExchange(&g_countGetRawInputBuffer, 0);
+    LONG getMessage = InterlockedExchange(&g_countGetMessage, 0);
+    LONG peekMessage = InterlockedExchange(&g_countPeekMessage, 0);
+    LONG spoofWmInput = InterlockedExchange(&g_countSpoofWmInput, 0);
     LONG getForeground = InterlockedExchange(&g_countGetForegroundWindow, 0);
     LONG getActive = InterlockedExchange(&g_countGetActiveWindow, 0);
     LONG getFocus = InterlockedExchange(&g_countGetFocus, 0);
@@ -1741,11 +1935,11 @@ static void LogCountersOnce()
     LONG spoofKeyboard = InterlockedExchange(&g_countSpoofKeyboard, 0);
     LONG spoofDeviceState = InterlockedExchange(&g_countSpoofDeviceState, 0);
 
-    wchar_t buffer[640] = {0};
+    wchar_t buffer[720] = {0};
     StringCchPrintfW(
         buffer,
         ARRAYSIZE(buffer),
-        L"[STAT] %s Win32: GetAsyncKeyState=%ld GetKeyboardState=%ld SpoofAsync=%ld SpoofKeyboard=%ld | Focus: Foreground=%ld Active=%ld Focus=%ld Spoof=%ld | DirectInput: DirectInput8Create=%ld CreateDevice=%ld GetDeviceState=%ld Fail=%ld NotAcquired=%ld GetDeviceData=%ld Acquire=%ld Poll=%ld Unacquire=%ld SpoofDI=%ld | RawInput: Register=%ld GetRawInputData=%ld GetRawInputBuffer=%ld | Profile=%lu Mode=%lu",
+        L"[STAT] %s Win32: GetAsyncKeyState=%ld GetKeyboardState=%ld SpoofAsync=%ld SpoofKeyboard=%ld | Focus: Foreground=%ld Active=%ld Focus=%ld Spoof=%ld | DirectInput: DirectInput8Create=%ld CreateDevice=%ld GetDeviceState=%ld Fail=%ld NotAcquired=%ld GetDeviceData=%ld Acquire=%ld Poll=%ld Unacquire=%ld SpoofDI=%ld | RawInput: Register=%ld GetRawInputData=%ld GetRawInputBuffer=%ld | Msg: GetMessage=%ld PeekMessage=%ld SpoofWmInput=%ld | Profile=%lu Mode=%lu",
         GetTimestamp().c_str(),
         getAsync,
         getKeyboard,
@@ -1768,6 +1962,9 @@ static void LogCountersOnce()
         rawRegister,
         rawData,
         rawBuffer,
+        getMessage,
+        peekMessage,
+        spoofWmInput,
         g_lastProfileId,
         g_lastProfileMode);
 

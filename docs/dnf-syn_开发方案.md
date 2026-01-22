@@ -105,12 +105,22 @@
 ### 3.1.2 RawInput（GetRawInputData / GetRawInputBuffer）伪造语义
 
 - 仅处理键盘 RawInput（`RIM_TYPEKEYBOARD`），避免影响鼠标/其他 HID。
-- 读取共享内存快照，根据 `targetMask` 与 `keyboardState` 重写 RawInput
-  中的 `VKey / MakeCode / Flags`，并设置对应的 `WM_KEYDOWN/WM_KEYUP`。
+- 读取共享内存快照，根据 `targetMask` 与 `keyboardState` 对目标键修正
+  `Make/Break`（仅在期望状态与事件不一致时改写），减少吞键风险。
 - 暂停或失联时对目标键输出抬起（Break），避免后台卡键或继续响应。
 - Mapping 模式使用目标键序列重写事件，确保源键映射到目标键后仍能生效。
 
-### 3.1.3 前台欺骗（Focus Spoof）
+### 3.1.3 消息层修正（WM_INPUT wParam）
+
+- 某些客户端在后台接收到 `WM_INPUT` 时，仅当 `wParam == RIM_INPUT` 才处理，
+  而 `RIM_INPUTSINK` 会被忽略，导致后台 RawInput 不生效。
+- Hook `GetMessageW/A` 与 `PeekMessageW/A`：
+  - 仅当共享内存存活且未暂停时启用修正。
+  - 仅对键盘 RawInput 生效（用 `GetRawInputData(RID_HEADER)` 判定）。
+  - 将 `wParam` 从 `RIM_INPUTSINK` 改为 `RIM_INPUT`，模拟前台输入语义。
+- 目的：让后台窗口也能处理 RawInput 键盘事件，避免特定键位失效。
+
+### 3.1.4 前台欺骗（Focus Spoof）
 
 - Hook `GetForegroundWindow` / `GetActiveWindow` / `GetFocus`，让后台进程在
   读取窗口焦点时返回自身主窗口句柄。
