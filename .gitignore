@@ -2,6 +2,13 @@
 .vs/
 [Bb]in/
 [Oo]bj/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+x64/
+x86/
+Win32/
 
 # Visual Studio 用户文件
 *.user
@@ -21,14 +28,17 @@
 # NuGet 包
 *.nupkg
 *.snupkg
+packages/
 
 # 测试与发布
 TestResults/
 publish/
+logs/
 
 # CMake / 原生构建产物
 build/
 **/build/
+cmake-build-*/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
@@ -44,12 +54,21 @@ out/
 *.exe
 *.exp
 *.ilk
+*.idb
 *.ipdb
 *.iobj
+*.ipch
 *.pch
 *.tlog
 *.lastbuildstate
 *.log
+*.dmp
+*.dump
+*.tmp
+*.bak
+*.swp
+*.swo
+ipch/
 
 # 第三方依赖（避免误提交嵌套仓库）
 dnfinput/third_party/minhook/.git/

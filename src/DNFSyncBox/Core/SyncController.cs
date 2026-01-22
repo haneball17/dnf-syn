@@ -1,7 +1,7 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Windows.Forms;
 using System.Windows.Threading;
 
@@ -22,9 +22,18 @@ public sealed class SyncController : IDisposable
     private readonly WindowManager _windowManager = new("DNF Taiwan", "dnf.exe");
     private readonly KeyboardHook _keyboardHook = new();
     private readonly KeyStateTracker _keyState = new();
+    private readonly SharedMemoryWriter _sharedMemory = new();
+    private readonly KeyboardProfileManager _profileManager = new();
     private readonly DispatcherTimer _scanTimer;
+    private readonly System.Threading.Timer _heartbeatTimer;
+
+    private readonly byte[] _keyboardState = new byte[SharedMemoryConstants.KeyCount];
+    private readonly uint[] _edgeCounter = new uint[SharedMemoryConstants.KeyCount];
+    private readonly byte[] _targetMask = new byte[SharedMemoryConstants.KeyCount];
+    private readonly byte[] _toggleState = new byte[SharedMemoryConstants.KeyCount];
 
     private WindowSnapshot _snapshot = WindowSnapshot.Empty;
+    private KeyboardProfile _activeProfile;
     private bool _userPaused;
     private bool _autoPaused = true;
     private bool _altDown;
@@ -45,11 +54,13 @@ public sealed class SyncController : IDisposable
     /// </summary>
     public SyncController()
     {
+        _activeProfile = _profileManager.ActiveProfile;
         _scanTimer = new DispatcherTimer
         {
             Interval = TimeSpan.FromSeconds(1)
         };
         _scanTimer.Tick += (_, _) => RefreshWindows();
+        _heartbeatTimer = new System.Threading.Timer(HeartbeatTick, null, Timeout.Infinite, Timeout.Infinite);
     }
 
     /// <summary>
@@ -59,8 +70,14 @@ public sealed class SyncController : IDisposable
     {
         _keyboardHook.KeyEvent += OnKeyEvent;
         _keyboardHook.Install();
+
+        TryInitializeSharedMemory();
+        ReloadProfileIfNeeded(force: true);
+        Log($"配置文件路径：{_profileManager.ConfigPath}");
+
         RefreshWindows();
         _scanTimer.Start();
+        _heartbeatTimer.Change(0, SharedMemoryConstants.HeartbeatIntervalMs);
     }
 
     /// <summary>
@@ -68,6 +85,8 @@ public sealed class SyncController : IDisposable
     /// </summary>
     public void RefreshWindows()
     {
+        ReloadProfileIfNeeded(force: false);
+
         var snapshot = _windowManager.Refresh();
         var autoPausedChanged = false;
         bool autoPaused;
@@ -121,33 +140,34 @@ public sealed class SyncController : IDisposable
         else
         {
             Log("已恢复同步");
+            PublishSnapshot(forceClear: false);
         }
 
         RaiseStatusChanged();
     }
 
     /// <summary>
-    /// 处理键盘钩子事件：热键、过滤、同步投递。
+    /// 处理键盘钩子事件：热键、过滤、共享内存写入。
     /// </summary>
     private void OnKeyEvent(Keys key, bool isDown)
     {
-        // 记录 Alt 状态，用于组合热键识别。
-        if (IsAltKey(key))
+        var isAltKey = IsAltKey(key);
+        if (isAltKey)
         {
             lock (_stateLock)
             {
                 _altDown = isDown;
             }
             LogVerbose($"热键辅助键 Alt：{(isDown ? "按下" : "抬起")}");
-            return;
         }
 
-        // Alt + . 热键：只在按下时触发一次，避免连发。
         if (key == Keys.OemPeriod)
         {
             var shouldToggle = false;
+            var altDown = false;
             lock (_stateLock)
             {
+                altDown = _altDown;
                 if (isDown && _altDown && !_hotkeyDown)
                 {
                     _hotkeyDown = true;
@@ -164,13 +184,18 @@ public sealed class SyncController : IDisposable
                 LogVerbose("热键触发：Alt + .");
                 TogglePause();
             }
-            return;
+
+            if (altDown)
+            {
+                // 热键组合时不写入 OemPeriod，避免误触同步。
+                return;
+            }
         }
 
-        // MVP 仅同步方向键。
-        if (!IsDirectionKey(key))
+        var vKey = (int)(key & Keys.KeyCode);
+        if (vKey < 0 || vKey >= SharedMemoryConstants.KeyCount)
         {
-            LogVerbose($"忽略非方向键：{key} {(isDown ? "按下" : "抬起")}");
+            LogVerbose($"忽略超范围键：{key}");
             return;
         }
 
@@ -180,85 +205,38 @@ public sealed class SyncController : IDisposable
 
         lock (_stateLock)
         {
-            // 更新按键状态，用于去重与清键。
-            changed = _keyState.SetState(key, isDown);
-            paused = IsPausedLocked();
             snapshot = _snapshot;
-        }
+            paused = IsPausedLocked();
 
-        if (!changed && isDown)
-        {
-            // 忽略重复按下，避免后端收到过多重复消息。
-            LogVerbose($"忽略重复按下：{key}");
-            return;
-        }
-
-        LogVerbose($"方向键事件：{key} {(isDown ? "按下" : "抬起")} | 暂停={paused} | 前台DNF={snapshot.ForegroundIsDnf} | 从控={snapshot.SlaveHandles.Count}");
-
-        // 暂停或前台不是 DNF 时不投递。
-        if (paused || !snapshot.ForegroundIsDnf)
-        {
-            LogVerbose("已拦截：暂停或前台非 DNF");
-            return;
-        }
-
-        foreach (var handle in snapshot.SlaveHandles)
-        {
-            var attempts = KeySender.PostKey(handle, key, isDown);
-            foreach (var attempt in attempts)
+            if (paused || !snapshot.ForegroundIsDnf)
             {
-                var targetLabel = attempt.IsChild ? "子窗口" : "主窗口";
-                var resultLabel = attempt.Success ? "成功" : $"失败(Win32Error={attempt.ErrorCode})";
-                var classLabel = string.IsNullOrWhiteSpace(attempt.ClassName) ? "未知类名" : attempt.ClassName;
-                var titleLabel = string.IsNullOrWhiteSpace(attempt.Title) ? "无标题" : attempt.Title;
-                var channelLabel = attempt.Channel == KeySender.SendChannel.ThreadMessage
-                    ? $"线程消息(TID={attempt.ThreadId})"
-                    : "窗口消息";
-                LogVerbose($"投递 {targetLabel} 0x{attempt.Target.ToInt64():X} [{classLabel}] \"{titleLabel}\"：{key} {(isDown ? "Down" : "Up")} {channelLabel} -> {resultLabel}");
+                return;
             }
+
+            changed = _keyState.SetState(vKey, isDown);
         }
+
+        if (!changed)
+        {
+            LogVerbose($"忽略重复按键：{key}");
+            return;
+        }
+
+        LogVerbose($"键盘事件：{key} {(isDown ? "按下" : "抬起")} | 暂停={paused} | 前台DNF={snapshot.ForegroundIsDnf}");
+        PublishSnapshot(forceClear: false);
     }
 
     /// <summary>
-    /// 清理所有按下状态，并向从控窗口发送 KeyUp，避免卡键。
+    /// 清理所有按下状态并通知共享内存，避免卡键。
     /// </summary>
     private void ClearStuckKeys()
     {
-        List<Keys> downKeys;
-        WindowSnapshot snapshot;
-
         lock (_stateLock)
         {
-            // 复制快照后清空，避免锁内执行投递。
-            downKeys = new List<Keys>(_keyState.GetDownKeys());
             _keyState.Clear();
-            snapshot = _snapshot;
         }
 
-        if (downKeys.Count == 0)
-        {
-            return;
-        }
-
-        LogVerbose($"清键触发：{string.Join(", ", downKeys)}");
-        foreach (var key in downKeys)
-        {
-            foreach (var handle in snapshot.SlaveHandles)
-            {
-                var attempts = KeySender.PostKey(handle, key, false);
-                foreach (var attempt in attempts)
-                {
-                    var targetLabel = attempt.IsChild ? "子窗口" : "主窗口";
-                    var resultLabel = attempt.Success ? "成功" : $"失败(Win32Error={attempt.ErrorCode})";
-                    var classLabel = string.IsNullOrWhiteSpace(attempt.ClassName) ? "未知类名" : attempt.ClassName;
-                    var titleLabel = string.IsNullOrWhiteSpace(attempt.Title) ? "无标题" : attempt.Title;
-                    var channelLabel = attempt.Channel == KeySender.SendChannel.ThreadMessage
-                        ? $"线程消息(TID={attempt.ThreadId})"
-                        : "窗口消息";
-                    LogVerbose($"清键 {targetLabel} 0x{attempt.Target.ToInt64():X} [{classLabel}] \"{titleLabel}\"：{key} Up {channelLabel} -> {resultLabel}");
-                }
-            }
-        }
+        PublishSnapshot(forceClear: true);
     }
 
     /// <summary>
@@ -286,6 +264,123 @@ public sealed class SyncController : IDisposable
             SlaveCount = snapshot.SlaveHandles.Count,
             TotalCount = snapshot.TotalCount
         });
+    }
+
+    /// <summary>
+    /// 发布共享内存快照（含心跳、方案与按键状态）。
+    /// </summary>
+    private void PublishSnapshot(bool forceClear)
+    {
+        if (!_sharedMemory.IsReady)
+        {
+            return;
+        }
+
+        WindowSnapshot snapshot;
+        KeyboardProfile profile;
+        bool paused;
+
+        lock (_stateLock)
+        {
+            snapshot = _snapshot;
+            profile = _activeProfile;
+            paused = IsPausedLocked();
+
+            UpdateToggleState();
+
+            if (paused)
+            {
+                Array.Clear(_keyboardState, 0, _keyboardState.Length);
+                _keyState.CopyEdgeCounters(_edgeCounter);
+                profile.BuildMask(_targetMask);
+            }
+            else
+            {
+                _keyState.ApplyProfile(profile, _toggleState, _keyboardState, _edgeCounter, _targetMask);
+            }
+        }
+
+        var flags = paused ? SharedMemoryConstants.FlagPaused : 0u;
+        if (forceClear)
+        {
+            flags |= SharedMemoryConstants.FlagClear;
+        }
+
+        var activePid = snapshot.ForegroundIsDnf ? snapshot.ForegroundProcessId : 0u;
+        var tick = (ulong)Environment.TickCount64;
+
+        _sharedMemory.PublishSnapshot(
+            flags,
+            activePid,
+            profile.ProfileId,
+            (uint)profile.Mode,
+            tick,
+            _keyboardState,
+            _edgeCounter,
+            _targetMask);
+    }
+
+    /// <summary>
+    /// 读取当前系统键盘切换态（Caps/Num/Scroll 等）。
+    /// </summary>
+    private void UpdateToggleState()
+    {
+        if (!NativeMethods.GetKeyboardState(_toggleState))
+        {
+            Array.Clear(_toggleState, 0, _toggleState.Length);
+            return;
+        }
+
+        for (var i = 0; i < _toggleState.Length; i++)
+        {
+            _toggleState[i] &= 0x01;
+        }
+    }
+
+    private void HeartbeatTick(object? state)
+    {
+        try
+        {
+            PublishSnapshot(forceClear: false);
+        }
+        catch (Exception ex)
+        {
+            Log($"共享内存心跳异常：{ex.Message}");
+        }
+    }
+
+    private void ReloadProfileIfNeeded(bool force)
+    {
+        var changed = _profileManager.ReloadIfChanged(out var message);
+        if (!force && !changed)
+        {
+            return;
+        }
+
+        lock (_stateLock)
+        {
+            _activeProfile = _profileManager.ActiveProfile;
+        }
+
+        if (!string.IsNullOrWhiteSpace(message))
+        {
+            Log(message);
+        }
+
+        PublishSnapshot(forceClear: true);
+    }
+
+    private void TryInitializeSharedMemory()
+    {
+        try
+        {
+            _sharedMemory.Initialize();
+            Log("共享内存已初始化");
+        }
+        catch (Exception ex)
+        {
+            Log($"共享内存初始化失败：{ex.Message}");
+        }
     }
 
     /// <summary>
@@ -330,14 +425,6 @@ public sealed class SyncController : IDisposable
     private bool IsPausedLocked() => _userPaused || _autoPaused;
 
     /// <summary>
-    /// 方向键过滤。
-    /// </summary>
-    private static bool IsDirectionKey(Keys key)
-    {
-        return key is Keys.Left or Keys.Right or Keys.Up or Keys.Down;
-    }
-
-    /// <summary>
     /// Alt 键判定（系统菜单键）。
     /// </summary>
     private static bool IsAltKey(Keys key)
@@ -358,7 +445,7 @@ public sealed class SyncController : IDisposable
         var slaves = snapshot.SlaveHandles.Count == 0
             ? "无"
             : string.Join(", ", snapshot.SlaveHandles.Select(h => $"0x{h.ToInt64():X}"));
-        var signature = $"{master}|{snapshot.ForegroundIsDnf}|{slaves}";
+        var signature = $"{master}|{snapshot.ForegroundIsDnf}|{snapshot.ForegroundProcessId}|{slaves}";
 
         if (signature == _lastSnapshotSignature)
         {
@@ -366,7 +453,7 @@ public sealed class SyncController : IDisposable
         }
 
         _lastSnapshotSignature = signature;
-        LogVerbose($"窗口扫描：总数={snapshot.TotalCount} 主控={master} 从控={slaves} 前台DNF={snapshot.ForegroundIsDnf}");
+        LogVerbose($"窗口扫描：总数={snapshot.TotalCount} 主控={master} 从控={slaves} 前台DNF={snapshot.ForegroundIsDnf} PID={snapshot.ForegroundProcessId}");
     }
 
     /// <summary>
@@ -377,5 +464,8 @@ public sealed class SyncController : IDisposable
         _scanTimer.Stop();
         _keyboardHook.KeyEvent -= OnKeyEvent;
         _keyboardHook.Dispose();
+        _heartbeatTimer.Change(Timeout.Infinite, Timeout.Infinite);
+        _heartbeatTimer.Dispose();
+        _sharedMemory.Dispose();
     }
 }

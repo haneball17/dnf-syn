@@ -7,6 +7,9 @@
 #include <strsafe.h>
 #include <intrin.h>
 #include <string>
+#include <cstdint>
+#include <cstring>
+#include <cwctype>
 
 #include "MinHook.h"
 
@@ -19,21 +22,90 @@ static HANDLE g_logFile = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_logLock;
 static LONG g_logReady = 0;
 static LONG g_shouldStop = 0;
+static std::wstring g_successFilePath;
+static LONG g_successFileCreated = 0;
 
 static volatile LONG g_countGetAsyncKeyState = 0;
 static volatile LONG g_countGetKeyboardState = 0;
 static volatile LONG g_countDirectInput8Create = 0;
 static volatile LONG g_countCreateDevice = 0;
 static volatile LONG g_countGetDeviceState = 0;
+static volatile LONG g_countGetDeviceStateFailed = 0;
+static volatile LONG g_countGetDeviceStateNotAcquired = 0;
 static volatile LONG g_countGetDeviceData = 0;
 static volatile LONG g_countAcquire = 0;
 static volatile LONG g_countPoll = 0;
 static volatile LONG g_countUnacquire = 0;
 static volatile LONG g_countRegisterRawInput = 0;
 static volatile LONG g_countGetRawInputData = 0;
+static volatile LONG g_countGetForegroundWindow = 0;
+static volatile LONG g_countGetActiveWindow = 0;
+static volatile LONG g_countGetFocus = 0;
+static volatile LONG g_countSpoofFocus = 0;
 
 static LONG g_createDeviceHooked = 0;
 static LONG g_deviceHooksHooked = 0;
+
+// ------------------------------
+// 共享内存与伪造配置
+// ------------------------------
+
+static const wchar_t* kSharedMemoryName = L"Local\\DNFSyncBox.KeyboardState.V1";
+static const uint32_t kSharedVersion = 1;
+static const uint32_t kFlagPaused = 0x1;
+static const uint32_t kFlagClear = 0x2;
+static const ULONGLONG kSharedTimeoutMs = 200;
+
+#pragma pack(push, 1)
+struct SharedKeyboardStateV1
+{
+    uint32_t version;
+    uint32_t seq;
+    uint32_t flags;
+    uint32_t activePid;
+    uint32_t profileId;
+    uint32_t profileMode;
+    uint64_t lastTick;
+    uint8_t keyboardState[256];
+    uint32_t edgeCounter[256];
+    uint8_t targetMask[256];
+};
+#pragma pack(pop)
+
+struct SharedSnapshot
+{
+    uint32_t seq;
+    uint32_t flags;
+    uint32_t activePid;
+    uint32_t profileId;
+    uint32_t profileMode;
+    uint64_t lastTick;
+    uint8_t keyboardState[256];
+    uint32_t edgeCounter[256];
+    uint8_t targetMask[256];
+};
+
+static HANDLE g_sharedMapping = nullptr;
+static SharedKeyboardStateV1* g_sharedState = nullptr;
+static DWORD g_lastSharedAttemptTick = 0;
+static LONG g_sharedReadyLogged = 0;
+static LONG g_sharedErrorLogged = 0;
+static LONG g_sharedVersionLogged = 0;
+static uint32_t g_lastEdgeCounter[256] = {};
+static uint32_t g_lastProfileId = 0;
+static uint32_t g_lastProfileMode = 0;
+static uint32_t g_lastClearSeq = 0;
+static volatile LONG g_countSpoofAsync = 0;
+static volatile LONG g_countSpoofKeyboard = 0;
+static volatile LONG g_countSpoofDeviceState = 0;
+
+static int g_vkeyToDik[256] = {};
+static LONG g_vkeyMapReady = 0;
+static LONG g_forceDeviceStateOk = -1;
+static LONG g_forceDeviceStateLogged = 0;
+
+static HWND g_selfWindowCache = nullptr;
+static DWORD g_selfWindowCacheTick = 0;
 
 // ------------------------------
 // MinHook 目标函数指针
@@ -50,6 +122,15 @@ static RegisterRawInputDevices_t g_origRegisterRawInputDevices = nullptr;
 
 using GetRawInputData_t = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
 static GetRawInputData_t g_origGetRawInputData = nullptr;
+
+using GetForegroundWindow_t = HWND(WINAPI*)();
+static GetForegroundWindow_t g_origGetForegroundWindow = nullptr;
+
+using GetActiveWindow_t = HWND(WINAPI*)();
+static GetActiveWindow_t g_origGetActiveWindow = nullptr;
+
+using GetFocus_t = HWND(WINAPI*)();
+static GetFocus_t g_origGetFocus = nullptr;
 
 using DirectInput8Create_t = HRESULT(WINAPI*)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
 static DirectInput8Create_t g_origDirectInput8Create = nullptr;
@@ -78,27 +159,132 @@ static Poll_t g_origPoll = nullptr;
 
 static std::wstring BuildLogPath()
 {
-    wchar_t basePath[MAX_PATH] = {0};
-    DWORD len = GetEnvironmentVariableW(L"APPDATA", basePath, ARRAYSIZE(basePath));
-    if (len == 0 || len >= ARRAYSIZE(basePath))
+    std::wstring baseDir;
+    wchar_t modulePath[MAX_PATH] = {0};
+    DWORD len = GetModuleFileNameW(g_module, modulePath, ARRAYSIZE(modulePath));
+    if (len > 0 && len < ARRAYSIZE(modulePath))
     {
-        GetTempPathW(ARRAYSIZE(basePath), basePath);
+        for (DWORD i = len; i > 0; i--)
+        {
+            if (modulePath[i - 1] == L'\\' || modulePath[i - 1] == L'/')
+            {
+                modulePath[i - 1] = L'\0';
+                break;
+            }
+        }
+        baseDir = modulePath;
     }
 
-    std::wstring base(basePath);
-    if (!base.empty() && (base.back() == L'\\' || base.back() == L'/'))
+    if (baseDir.empty())
     {
-        base.pop_back();
+        wchar_t currentDir[MAX_PATH] = {0};
+        if (GetCurrentDirectoryW(ARRAYSIZE(currentDir), currentDir) > 0)
+        {
+            baseDir = currentDir;
+        }
+        else
+        {
+            baseDir = L".";
+        }
     }
-
-    std::wstring dnfDir = base + L"\\DNFSyncBox";
-    std::wstring logDir = dnfDir + L"\\logs";
-    CreateDirectoryW(dnfDir.c_str(), nullptr);
-    CreateDirectoryW(logDir.c_str(), nullptr);
 
     wchar_t fileName[MAX_PATH] = {0};
-    StringCchPrintfW(fileName, ARRAYSIZE(fileName), L"%s\\dnfinput_%lu.log", logDir.c_str(), GetCurrentProcessId());
+    StringCchPrintfW(fileName, ARRAYSIZE(fileName), L"%s\\dnfinput_%lu.log", baseDir.c_str(), GetCurrentProcessId());
     return std::wstring(fileName);
+}
+
+static std::wstring GetModuleBaseName()
+{
+    wchar_t modulePath[MAX_PATH] = {0};
+    DWORD len = GetModuleFileNameW(g_module, modulePath, ARRAYSIZE(modulePath));
+    if (len == 0 || len >= ARRAYSIZE(modulePath))
+    {
+        return L"dnfinput";
+    }
+
+    const wchar_t* fileName = modulePath;
+    for (DWORD i = 0; i < len; i++)
+    {
+        if (modulePath[i] == L'\\' || modulePath[i] == L'/')
+        {
+            fileName = modulePath + i + 1;
+        }
+    }
+
+    std::wstring name(fileName);
+    size_t dot = name.rfind(L'.');
+    if (dot != std::wstring::npos)
+    {
+        name = name.substr(0, dot);
+    }
+
+    for (auto& ch : name)
+    {
+        ch = static_cast<wchar_t>(towlower(ch));
+    }
+
+    return name.empty() ? L"dnfinput" : name;
+}
+
+static std::wstring BuildSuccessFilePath()
+{
+    std::wstring logPath = BuildLogPath();
+    size_t slash = logPath.rfind(L'\\');
+    std::wstring logDir = slash == std::wstring::npos ? L"." : logPath.substr(0, slash);
+    std::wstring dllName = GetModuleBaseName();
+    std::wstring fileName = L"successfile_" + dllName + L"_" + std::to_wstring(GetCurrentProcessId()) + L".txt";
+    return logDir + L"\\" + fileName;
+}
+
+// 提前声明，避免在 success file 写入处触发未声明错误
+static void WriteUtf8BomIfEmpty(HANDLE file);
+static std::wstring GetTimestamp();
+static std::string WideToUtf8(const std::wstring& input);
+
+// 注入成功后创建 success file，写入时间戳便于外部判断
+static void WriteSuccessFile()
+{
+    if (InterlockedCompareExchange(&g_successFileCreated, 1, 1) == 1)
+    {
+        return;
+    }
+
+    g_successFilePath = BuildSuccessFilePath();
+    HANDLE file = CreateFileW(
+        g_successFilePath.c_str(),
+        FILE_GENERIC_WRITE,
+        FILE_SHARE_READ,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    WriteUtf8BomIfEmpty(file);
+    std::wstring line = GetTimestamp() + L"\r\n";
+    std::string utf8 = WideToUtf8(line);
+    if (!utf8.empty())
+    {
+        DWORD written = 0;
+        WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
+    }
+
+    CloseHandle(file);
+    InterlockedExchange(&g_successFileCreated, 1);
+}
+
+// 进程退出时清理 success file，避免残留误判
+static void RemoveSuccessFile()
+{
+    if (g_successFilePath.empty())
+    {
+        return;
+    }
+
+    DeleteFileW(g_successFilePath.c_str());
 }
 
 static void WriteUtf8BomIfEmpty(HANDLE file)
@@ -358,19 +544,425 @@ static bool ErasePeHeader(HMODULE module)
 }
 
 // ------------------------------
+// 共享内存读取与快照
+// ------------------------------
+
+static bool EnsureSharedMemory()
+{
+    if (g_sharedState)
+    {
+        return true;
+    }
+
+    DWORD now = GetTickCount();
+    if (now - g_lastSharedAttemptTick < 1000)
+    {
+        return false;
+    }
+    g_lastSharedAttemptTick = now;
+
+    HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, kSharedMemoryName);
+    if (!mapping)
+    {
+        if (InterlockedCompareExchange(&g_sharedErrorLogged, 1, 0) == 0)
+        {
+            LogError(L"共享内存未就绪，等待控制端启动");
+        }
+        return false;
+    }
+
+    void* view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, sizeof(SharedKeyboardStateV1));
+    if (!view)
+    {
+        CloseHandle(mapping);
+        return false;
+    }
+
+    g_sharedMapping = mapping;
+    g_sharedState = static_cast<SharedKeyboardStateV1*>(view);
+
+    if (InterlockedCompareExchange(&g_sharedReadyLogged, 1, 0) == 0)
+    {
+        LogInfo(L"共享内存已连接");
+    }
+
+    return true;
+}
+
+static bool ReadSharedSnapshot(SharedSnapshot& snapshot)
+{
+    if (!EnsureSharedMemory() || !g_sharedState)
+    {
+        return false;
+    }
+
+    if (g_sharedState->version != kSharedVersion)
+    {
+        if (InterlockedCompareExchange(&g_sharedVersionLogged, 1, 0) == 0)
+        {
+            LogError(L"共享内存版本不匹配，已停止伪造");
+        }
+        return false;
+    }
+
+    for (int i = 0; i < 3; i++)
+    {
+        uint32_t seq1 = g_sharedState->seq;
+        if ((seq1 & 1) != 0)
+        {
+            continue;
+        }
+
+        snapshot.seq = seq1;
+        snapshot.flags = g_sharedState->flags;
+        snapshot.activePid = g_sharedState->activePid;
+        snapshot.profileId = g_sharedState->profileId;
+        snapshot.profileMode = g_sharedState->profileMode;
+        snapshot.lastTick = g_sharedState->lastTick;
+        memcpy(snapshot.keyboardState, g_sharedState->keyboardState, sizeof(snapshot.keyboardState));
+        memcpy(snapshot.edgeCounter, g_sharedState->edgeCounter, sizeof(snapshot.edgeCounter));
+        memcpy(snapshot.targetMask, g_sharedState->targetMask, sizeof(snapshot.targetMask));
+
+        uint32_t seq2 = g_sharedState->seq;
+        if (seq1 == seq2 && (seq2 & 1) == 0)
+        {
+            g_lastProfileId = snapshot.profileId;
+            g_lastProfileMode = snapshot.profileMode;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void ApplyClearIfNeeded(const SharedSnapshot& snapshot)
+{
+    if ((snapshot.flags & kFlagClear) == 0)
+    {
+        return;
+    }
+
+    if (snapshot.seq == g_lastClearSeq)
+    {
+        return;
+    }
+
+    g_lastClearSeq = snapshot.seq;
+    for (int i = 0; i < 256; i++)
+    {
+        g_lastEdgeCounter[i] = snapshot.edgeCounter[i];
+    }
+}
+
+static bool IsSnapshotAlive(const SharedSnapshot& snapshot)
+{
+    if (snapshot.lastTick == 0)
+    {
+        return false;
+    }
+
+    ULONGLONG now = GetTickCount64();
+    return now - snapshot.lastTick <= kSharedTimeoutMs;
+}
+
+static bool IsBypassProcess(const SharedSnapshot& snapshot)
+{
+    if (snapshot.activePid == 0)
+    {
+        return false;
+    }
+
+    return snapshot.activePid == GetCurrentProcessId();
+}
+
+static void EnsureVkeyToDikMap()
+{
+    // DirectInput 键盘使用 DIK 扫描码索引 256 字节状态数组，这里把 vKey 映射到 DIK
+    // 以复用共享内存的键盘状态；扩展键需要补 0x80。
+    if (InterlockedCompareExchange(&g_vkeyMapReady, 1, 0) != 0)
+    {
+        return;
+    }
+
+    for (int i = 0; i < 256; i++)
+    {
+        g_vkeyToDik[i] = -1;
+    }
+
+    for (int vKey = 0; vKey < 256; vKey++)
+    {
+        UINT scan = MapVirtualKeyW(static_cast<UINT>(vKey), MAPVK_VK_TO_VSC_EX);
+        if (scan == 0)
+        {
+            continue;
+        }
+
+        int dik = static_cast<int>(scan & 0xFF);
+        if ((scan & 0x100) != 0)
+        {
+            dik |= 0x80;
+        }
+
+        if (dik >= 0 && dik < 256)
+        {
+            g_vkeyToDik[vKey] = dik;
+        }
+    }
+}
+
+static bool ShouldForceDeviceStateOk()
+{
+    LONG cached = InterlockedCompareExchange(&g_forceDeviceStateOk, -1, -1);
+    if (cached != -1)
+    {
+        return cached != 0;
+    }
+
+    wchar_t value[8] = {0};
+    DWORD len = GetEnvironmentVariableW(L"DNFSYNC_FORCE_DI_OK", value, ARRAYSIZE(value));
+    bool enabled = false;
+    if (len > 0)
+    {
+        wchar_t ch = value[0];
+        enabled = (ch == L'1' || ch == L'y' || ch == L'Y' || ch == L't' || ch == L'T');
+    }
+
+    InterlockedExchange(&g_forceDeviceStateOk, enabled ? 1 : 0);
+    return enabled;
+}
+
+struct WindowSearchContext
+{
+    DWORD pid;
+    HWND best;
+    HWND fallback;
+};
+
+static BOOL CALLBACK EnumWindowsFindSelf(HWND hwnd, LPARAM lparam)
+{
+    auto* ctx = reinterpret_cast<WindowSearchContext*>(lparam);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != ctx->pid)
+    {
+        return TRUE;
+    }
+
+    if (!IsWindowVisible(hwnd))
+    {
+        return TRUE;
+    }
+
+    if (GetWindow(hwnd, GW_OWNER) != nullptr)
+    {
+        return TRUE;
+    }
+
+    if (!ctx->fallback)
+    {
+        ctx->fallback = hwnd;
+    }
+
+    if (GetWindowTextLengthW(hwnd) > 0)
+    {
+        ctx->best = hwnd;
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static HWND GetSelfMainWindow()
+{
+    if (g_selfWindowCache && IsWindow(g_selfWindowCache))
+    {
+        return g_selfWindowCache;
+    }
+
+    DWORD now = GetTickCount();
+    if (now - g_selfWindowCacheTick < 1000)
+    {
+        return g_selfWindowCache;
+    }
+
+    g_selfWindowCacheTick = now;
+    WindowSearchContext ctx = {};
+    ctx.pid = GetCurrentProcessId();
+    EnumWindows(EnumWindowsFindSelf, reinterpret_cast<LPARAM>(&ctx));
+
+    HWND result = ctx.best ? ctx.best : ctx.fallback;
+    if (result && IsWindow(result))
+    {
+        g_selfWindowCache = result;
+    }
+
+    return g_selfWindowCache;
+}
+
+static bool IsWindowOwnedBySelf(HWND hwnd)
+{
+    if (!hwnd)
+    {
+        return false;
+    }
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+static bool ShouldSpoofFocus()
+{
+    // 仅在后台且共享内存存活/未暂停时伪造焦点，避免影响前台与暂停态。
+    SharedSnapshot snapshot = {};
+    if (!ReadSharedSnapshot(snapshot))
+    {
+        return false;
+    }
+
+    if (!IsSnapshotAlive(snapshot))
+    {
+        return false;
+    }
+
+    if ((snapshot.flags & kFlagPaused) != 0)
+    {
+        return false;
+    }
+
+    if (snapshot.activePid == 0)
+    {
+        return false;
+    }
+
+    if (IsBypassProcess(snapshot))
+    {
+        return false;
+    }
+
+    return true;
+}
+
+// ------------------------------
 // Hook 回调
 // ------------------------------
 
 static SHORT WINAPI Hook_GetAsyncKeyState(int vKey)
 {
     InterlockedIncrement(&g_countGetAsyncKeyState);
-    return g_origGetAsyncKeyState ? g_origGetAsyncKeyState(vKey) : 0;
+
+    if (!g_origGetAsyncKeyState)
+    {
+        return 0;
+    }
+
+    SHORT original = g_origGetAsyncKeyState(vKey);
+    if (vKey < 0 || vKey >= 256)
+    {
+        return original;
+    }
+
+    SharedSnapshot snapshot = {};
+    if (!ReadSharedSnapshot(snapshot))
+    {
+        return original;
+    }
+
+    ApplyClearIfNeeded(snapshot);
+
+    if (IsBypassProcess(snapshot))
+    {
+        return original;
+    }
+
+    const bool alive = IsSnapshotAlive(snapshot);
+    const bool paused = (snapshot.flags & kFlagPaused) != 0;
+    const bool shouldOverride = snapshot.targetMask[vKey] != 0;
+
+    if (!shouldOverride)
+    {
+        return original;
+    }
+
+    if (!alive || paused)
+    {
+        return 0;
+    }
+
+    SHORT result = 0;
+    if (snapshot.keyboardState[vKey] & 0x80)
+    {
+        result |= static_cast<SHORT>(0x8000);
+    }
+
+    uint32_t currentEdge = snapshot.edgeCounter[vKey];
+    if (currentEdge != g_lastEdgeCounter[vKey])
+    {
+        g_lastEdgeCounter[vKey] = currentEdge;
+        result |= 0x0001;
+    }
+
+    InterlockedIncrement(&g_countSpoofAsync);
+    return result;
 }
 
 static BOOL WINAPI Hook_GetKeyboardState(PBYTE lpKeyState)
 {
     InterlockedIncrement(&g_countGetKeyboardState);
-    return g_origGetKeyboardState ? g_origGetKeyboardState(lpKeyState) : FALSE;
+
+    if (!g_origGetKeyboardState)
+    {
+        return FALSE;
+    }
+
+    BOOL ok = g_origGetKeyboardState(lpKeyState);
+    if (!ok || !lpKeyState)
+    {
+        return ok;
+    }
+
+    SharedSnapshot snapshot = {};
+    if (!ReadSharedSnapshot(snapshot))
+    {
+        return ok;
+    }
+
+    ApplyClearIfNeeded(snapshot);
+
+    if (IsBypassProcess(snapshot))
+    {
+        return ok;
+    }
+
+    const bool alive = IsSnapshotAlive(snapshot);
+    const bool paused = (snapshot.flags & kFlagPaused) != 0;
+    bool spoofed = false;
+
+    for (int i = 0; i < 256; i++)
+    {
+        if (snapshot.targetMask[i] == 0)
+        {
+            continue;
+        }
+
+        if (!alive || paused)
+        {
+            lpKeyState[i] &= static_cast<BYTE>(~0x81);
+            spoofed = true;
+            continue;
+        }
+
+        BYTE desired = snapshot.keyboardState[i];
+        lpKeyState[i] = (lpKeyState[i] & static_cast<BYTE>(~0x81)) | (desired & 0x81);
+        spoofed = true;
+    }
+
+    if (spoofed)
+    {
+        InterlockedIncrement(&g_countSpoofKeyboard);
+    }
+
+    return ok;
 }
 
 static BOOL WINAPI Hook_RegisterRawInputDevices(PCRAWINPUTDEVICE devices, UINT numDevices, UINT size)
@@ -385,10 +977,173 @@ static UINT WINAPI Hook_GetRawInputData(HRAWINPUT hRawInput, UINT command, LPVOI
     return g_origGetRawInputData ? g_origGetRawInputData(hRawInput, command, data, size, headerSize) : 0;
 }
 
+static HWND WINAPI Hook_GetForegroundWindow()
+{
+    InterlockedIncrement(&g_countGetForegroundWindow);
+    HWND original = g_origGetForegroundWindow ? g_origGetForegroundWindow() : nullptr;
+    if (!ShouldSpoofFocus())
+    {
+        return original;
+    }
+
+    // 后台时伪造前台窗口，避免客户端因焦点限制丢弃输入。
+    if (IsWindowOwnedBySelf(original))
+    {
+        return original;
+    }
+
+    HWND selfWindow = GetSelfMainWindow();
+    if (!selfWindow)
+    {
+        return original;
+    }
+
+    InterlockedIncrement(&g_countSpoofFocus);
+    return selfWindow;
+}
+
+static HWND WINAPI Hook_GetActiveWindow()
+{
+    InterlockedIncrement(&g_countGetActiveWindow);
+    HWND original = g_origGetActiveWindow ? g_origGetActiveWindow() : nullptr;
+    if (!ShouldSpoofFocus())
+    {
+        return original;
+    }
+
+    if (IsWindowOwnedBySelf(original))
+    {
+        return original;
+    }
+
+    HWND selfWindow = GetSelfMainWindow();
+    if (!selfWindow)
+    {
+        return original;
+    }
+
+    InterlockedIncrement(&g_countSpoofFocus);
+    return selfWindow;
+}
+
+static HWND WINAPI Hook_GetFocus()
+{
+    InterlockedIncrement(&g_countGetFocus);
+    HWND original = g_origGetFocus ? g_origGetFocus() : nullptr;
+    if (!ShouldSpoofFocus())
+    {
+        return original;
+    }
+
+    if (IsWindowOwnedBySelf(original))
+    {
+        return original;
+    }
+
+    HWND selfWindow = GetSelfMainWindow();
+    if (!selfWindow)
+    {
+        return original;
+    }
+
+    InterlockedIncrement(&g_countSpoofFocus);
+    return selfWindow;
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_GetDeviceState(IDirectInputDevice8W* device, DWORD size, LPVOID data)
 {
     InterlockedIncrement(&g_countGetDeviceState);
-    return g_origGetDeviceState ? g_origGetDeviceState(device, size, data) : DIERR_GENERIC;
+
+    if (!g_origGetDeviceState)
+    {
+        return DIERR_GENERIC;
+    }
+
+    HRESULT hr = g_origGetDeviceState(device, size, data);
+    bool forceOk = false;
+    if (FAILED(hr))
+    {
+        InterlockedIncrement(&g_countGetDeviceStateFailed);
+        if (hr == DIERR_NOTACQUIRED)
+        {
+            InterlockedIncrement(&g_countGetDeviceStateNotAcquired);
+            forceOk = ShouldForceDeviceStateOk();
+            if (!forceOk)
+            {
+                return hr;
+            }
+        }
+        else
+        {
+            return hr;
+        }
+    }
+
+    // DirectInput 键盘状态固定 256 字节，避免对非键盘设备误改。
+    if (size < 256 || !data)
+    {
+        return hr;
+    }
+
+    SharedSnapshot snapshot = {};
+    if (!ReadSharedSnapshot(snapshot))
+    {
+        return hr;
+    }
+
+    ApplyClearIfNeeded(snapshot);
+    if (IsBypassProcess(snapshot))
+    {
+        return hr;
+    }
+
+    const bool alive = IsSnapshotAlive(snapshot);
+    const bool paused = (snapshot.flags & kFlagPaused) != 0;
+
+    // DNF 走 DirectInput 轮询时需要覆盖 GetDeviceState，否则后台状态无法被读取到。
+    EnsureVkeyToDikMap();
+    auto* state = static_cast<BYTE*>(data);
+    bool spoofed = false;
+
+    for (int vKey = 0; vKey < 256; vKey++)
+    {
+        if (snapshot.targetMask[vKey] == 0)
+        {
+            continue;
+        }
+
+        int dik = g_vkeyToDik[vKey];
+        if (dik < 0 || dik >= 256)
+        {
+            continue;
+        }
+
+        if (!alive || paused)
+        {
+            state[dik] = 0;
+            spoofed = true;
+            continue;
+        }
+
+        state[dik] = (snapshot.keyboardState[vKey] & 0x80) ? 0x80 : 0x00;
+        spoofed = true;
+    }
+
+    if (spoofed)
+    {
+        InterlockedIncrement(&g_countSpoofDeviceState);
+    }
+
+    if (forceOk && spoofed)
+    {
+        if (InterlockedCompareExchange(&g_forceDeviceStateLogged, 1, 0) == 0)
+        {
+            LogInfo(L"GetDeviceState 返回 DIERR_NOTACQUIRED，已按配置强制返回 DI_OK");
+        }
+        return DI_OK;
+    }
+
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_GetDeviceData(
@@ -591,6 +1346,39 @@ static void InstallUser32Hooks()
             MH_EnableHook(rawData);
         }
     }
+
+    auto* getForeground = reinterpret_cast<LPVOID>(GetProcAddress(user32, "GetForegroundWindow"));
+    if (getForeground)
+    {
+        MH_STATUS status = MH_CreateHook(getForeground, Hook_GetForegroundWindow, reinterpret_cast<LPVOID*>(&g_origGetForegroundWindow));
+        LogMinHookStatus(L"Hook GetForegroundWindow", status);
+        if (status == MH_OK)
+        {
+            MH_EnableHook(getForeground);
+        }
+    }
+
+    auto* getActive = reinterpret_cast<LPVOID>(GetProcAddress(user32, "GetActiveWindow"));
+    if (getActive)
+    {
+        MH_STATUS status = MH_CreateHook(getActive, Hook_GetActiveWindow, reinterpret_cast<LPVOID*>(&g_origGetActiveWindow));
+        LogMinHookStatus(L"Hook GetActiveWindow", status);
+        if (status == MH_OK)
+        {
+            MH_EnableHook(getActive);
+        }
+    }
+
+    auto* getFocus = reinterpret_cast<LPVOID>(GetProcAddress(user32, "GetFocus"));
+    if (getFocus)
+    {
+        MH_STATUS status = MH_CreateHook(getFocus, Hook_GetFocus, reinterpret_cast<LPVOID*>(&g_origGetFocus));
+        LogMinHookStatus(L"Hook GetFocus", status);
+        if (status == MH_OK)
+        {
+            MH_EnableHook(getFocus);
+        }
+    }
 }
 
 static void InstallDirectInputHook()
@@ -631,30 +1419,50 @@ static void LogCountersOnce()
     LONG diCreate = InterlockedExchange(&g_countDirectInput8Create, 0);
     LONG createDevice = InterlockedExchange(&g_countCreateDevice, 0);
     LONG getState = InterlockedExchange(&g_countGetDeviceState, 0);
+    LONG getStateFailed = InterlockedExchange(&g_countGetDeviceStateFailed, 0);
+    LONG getStateNotAcquired = InterlockedExchange(&g_countGetDeviceStateNotAcquired, 0);
     LONG getData = InterlockedExchange(&g_countGetDeviceData, 0);
     LONG acquire = InterlockedExchange(&g_countAcquire, 0);
     LONG poll = InterlockedExchange(&g_countPoll, 0);
     LONG unacquire = InterlockedExchange(&g_countUnacquire, 0);
     LONG rawRegister = InterlockedExchange(&g_countRegisterRawInput, 0);
     LONG rawData = InterlockedExchange(&g_countGetRawInputData, 0);
+    LONG getForeground = InterlockedExchange(&g_countGetForegroundWindow, 0);
+    LONG getActive = InterlockedExchange(&g_countGetActiveWindow, 0);
+    LONG getFocus = InterlockedExchange(&g_countGetFocus, 0);
+    LONG spoofFocus = InterlockedExchange(&g_countSpoofFocus, 0);
+    LONG spoofAsync = InterlockedExchange(&g_countSpoofAsync, 0);
+    LONG spoofKeyboard = InterlockedExchange(&g_countSpoofKeyboard, 0);
+    LONG spoofDeviceState = InterlockedExchange(&g_countSpoofDeviceState, 0);
 
-    wchar_t buffer[512] = {0};
+    wchar_t buffer[640] = {0};
     StringCchPrintfW(
         buffer,
         ARRAYSIZE(buffer),
-        L"[STAT] %s Win32: GetAsyncKeyState=%ld GetKeyboardState=%ld | DirectInput: DirectInput8Create=%ld CreateDevice=%ld GetDeviceState=%ld GetDeviceData=%ld Acquire=%ld Poll=%ld Unacquire=%ld | RawInput: Register=%ld GetRawInputData=%ld",
+        L"[STAT] %s Win32: GetAsyncKeyState=%ld GetKeyboardState=%ld SpoofAsync=%ld SpoofKeyboard=%ld | Focus: Foreground=%ld Active=%ld Focus=%ld Spoof=%ld | DirectInput: DirectInput8Create=%ld CreateDevice=%ld GetDeviceState=%ld Fail=%ld NotAcquired=%ld GetDeviceData=%ld Acquire=%ld Poll=%ld Unacquire=%ld SpoofDI=%ld | RawInput: Register=%ld GetRawInputData=%ld | Profile=%lu Mode=%lu",
         GetTimestamp().c_str(),
         getAsync,
         getKeyboard,
+        spoofAsync,
+        spoofKeyboard,
+        getForeground,
+        getActive,
+        getFocus,
+        spoofFocus,
         diCreate,
         createDevice,
         getState,
+        getStateFailed,
+        getStateNotAcquired,
         getData,
         acquire,
         poll,
         unacquire,
+        spoofDeviceState,
         rawRegister,
-        rawData);
+        rawData,
+        g_lastProfileId,
+        g_lastProfileMode);
 
     WriteLogLine(buffer);
 }
@@ -663,6 +1471,8 @@ static DWORD WINAPI WorkerThread(LPVOID)
 {
     // 所有耗时与高风险操作都放在工作线程，避免 DllMain 触发 Loader Lock
     InitializeLogging();
+    // 成功文件写入：避免在 DllMain 中做 I/O，降低 Loader Lock 风险
+    WriteSuccessFile();
 
     LogInfo(L"工作线程启动，准备初始化 MinHook 与输入路径统计");
 
@@ -723,6 +1533,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     else if (reason == DLL_PROCESS_DETACH)
     {
         InterlockedExchange(&g_shouldStop, 1);
+        // 进程退出时清理 success file，避免残留误判
+        RemoveSuccessFile();
     }
 
     return TRUE;

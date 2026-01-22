@@ -1,15 +1,16 @@
 # DNF Sync Box - 键盘状态伪造同步实现方案
 
 一句话概述：通过共享内存（seq 无锁快照）把前台 UI 的全键盘状态同步到后台
-DNF 进程，在被注入的 `dnfinput.dll` 中 Hook `GetAsyncKeyState`/
-`GetKeyboardState` 进行伪造返回，支持多种配置方案切换。
+DNF 进程，在被注入的 `dnfinput.dll` 中 Hook Win32/DirectInput
+读取路径（`GetAsyncKeyState`/`GetKeyboardState`/`GetDeviceState`）进行
+伪造返回，支持多种配置方案切换。
 
 ---
 
 ## 1. 需求确认与设想验证
 
 - 你提出的判断：当前阶段属于“给出方案”而非直接实现 → **正确**。
-- 已确认输入路径以 Win32 `GetAsyncKeyState` 为主。
+- 日志显示 DirectInput 调用频繁，需补齐 `GetDeviceState` 伪造。
 - 目标调整：从“仅方向键”扩展为“全按键可伪造 + 方案可配置”。
 
 > 说明：该变更超出 MVP 方向键范围，需同步更新设计文档与 UI 配置能力。
@@ -26,7 +27,8 @@ DNF 进程，在被注入的 `dnfinput.dll` 中 Hook `GetAsyncKeyState`/
   - 负责自动暂停、前台切换与清键策略。
 
 - **`dnfinput.dll`（被注入端）**
-  - Hook `GetAsyncKeyState` / `GetKeyboardState`。
+  - Hook `GetAsyncKeyState` / `GetKeyboardState` / `GetDeviceState`。
+  - 通过 `DirectInput8Create`/`CreateDevice` 安装设备级 Hook。
   - 读取共享内存快照，按方案伪造返回。
   - 对前台 PID 做旁路：前台进程优先透传，后台进程伪造。
 
@@ -60,9 +62,11 @@ DNF 进程，在被注入的 `dnfinput.dll` 中 Hook `GetAsyncKeyState`/
 - `flags`：暂停/清键/旁路等控制位
 - `activePid`：当前前台 DNF 进程 PID，用于旁路控制
 - `profileId`：当前方案 ID
+- `profileMode`：当前方案模式（All/Whitelist/Blacklist/Mapping）
 - `lastTick`：心跳（GetTickCount64）
 - `keyboardState[256]`：对齐 `GetKeyboardState` 语义（按下=0x80）
 - `edgeCounter[256]`：按键按下事件计数（用于 `GetAsyncKeyState` 低位）
+- `targetMask[256]`：目标键覆盖掩码（1 表示覆盖）
 
 ### 3.3 快照读取示例（读端）
 
@@ -81,6 +85,8 @@ DNF 进程，在被注入的 `dnfinput.dll` 中 Hook `GetAsyncKeyState`/
 
 - `GetAsyncKeyState(int vKey)`
 - `GetKeyboardState(BYTE* lpKeyState)`
+- `IDirectInputDevice8::GetDeviceState(DWORD, LPVOID)`
+- `GetForegroundWindow / GetActiveWindow / GetFocus`（前台欺骗）
 
 ### 4.2 伪造逻辑
 
@@ -100,6 +106,24 @@ DNF 进程，在被注入的 `dnfinput.dll` 中 Hook `GetAsyncKeyState`/
 - UI 报告 `VK_LEFT` 按下 → 返回 `0x8001`
 - UI 报告 `VK_LEFT` 释放 → 返回 `0x0000`
 
+### 4.3 DirectInput 伪造要点
+
+- `GetDeviceState` 先透传原始结果，再按方案覆盖键盘状态数组。
+- DirectInput 键盘状态固定 256 字节，索引为 DIK 扫描码。
+- 通过 `MapVirtualKeyW(MAPVK_VK_TO_VSC_EX)` 将 vKey 映射为 DIK
+  （扩展键补 `0x80`），只覆盖 `targetMask` 命中的键。
+
+**原因**：DNF 在后台主要通过 DirectInput 轮询键盘，单靠 Win32
+伪造无法同步到后台读取路径。
+
+### 4.4 前台欺骗（Focus Spoof）
+
+- Hook `GetForegroundWindow` / `GetActiveWindow` / `GetFocus`，当进程处于后台时
+  伪造返回自身主窗口句柄。
+- 仅在共享内存存活、未暂停且当前进程不是前台 DNF 时生效，避免干扰前台行为。
+
+**原因**：部分客户端会在后台直接丢弃输入或跳过逻辑判断，通过前台欺骗可
+让后台进程继续应用伪造的键盘状态。
 ---
 
 ## 5. 方案配置设计（全键伪造 + 可配置）
@@ -113,6 +137,8 @@ DNF 进程，在被注入的 `dnfinput.dll` 中 Hook `GetAsyncKeyState`/
 
 ### 5.2 配置格式（建议 JSON）
 
+配置文件：`%AppData%\\DNFSyncBox\\profiles.json`
+
 ```json
 {
   "activeProfile": "full",
@@ -124,12 +150,22 @@ DNF 进程，在被注入的 `dnfinput.dll` 中 Hook `GetAsyncKeyState`/
     {
       "id": "wasd",
       "mode": "Whitelist",
-      "keys": ["W", "A", "S", "D", "SPACE"]
+      "keys": ["W", "A", "S", "D", "Space"]
     },
     {
       "id": "arrows",
       "mode": "Blacklist",
       "keys": ["F1", "F2", "F3"]
+    },
+    {
+      "id": "map1",
+      "mode": "Mapping",
+      "mappings": {
+        "W": "Up",
+        "A": "Left",
+        "S": "Down",
+        "D": "Right"
+      }
     }
   ]
 }
@@ -170,6 +206,10 @@ DNF 进程，在被注入的 `dnfinput.dll` 中 Hook `GetAsyncKeyState`/
   - 回退策略：可切到 `Whitelist` 只伪造指定键
 - **风险**：低位语义不完全一致
   - 回退策略：只返回高位；或在 UI 端强化按下事件计数
+- **风险**：DirectInput 设备类型复杂
+  - 回退策略：只在状态数组为 256 字节时覆盖，避免非键盘设备
+- **风险**：前台欺骗可能影响窗口焦点判定
+  - 回退策略：仅在后台/未暂停时启用，必要时关闭该 Hook
 
 ---
 
@@ -192,4 +232,4 @@ DNF 进程，在被注入的 `dnfinput.dll` 中 Hook `GetAsyncKeyState`/
 
 ---
 
-> 如需进入实现阶段，请确认配置文件位置、默认方案与切换方式。
+> 已落地约定：配置文件位于 `%AppData%\\DNFSyncBox\\profiles.json`，默认方案为 `full/All`，文件更新会自动热切换（约 1 秒内生效）。

@@ -54,6 +54,7 @@ public sealed class WindowManager
         var master = foregroundIsDnf
             ? ChooseBestHandle(windows, foregroundPid)
             : IntPtr.Zero;
+        var activePid = foregroundIsDnf ? foregroundPid : 0;
 
         var slaveHandles = new List<IntPtr>();
         var seenPids = new HashSet<uint>();
@@ -77,7 +78,7 @@ public sealed class WindowManager
         }
 
         var processCount = seenPids.Count + (foregroundIsDnf ? 1 : 0);
-        return new WindowSnapshot(master, slaveHandles, foregroundIsDnf, processCount);
+        return new WindowSnapshot(master, slaveHandles, foregroundIsDnf, processCount, activePid);
     }
 
     private IntPtr ChooseBestHandle(List<WindowInfo> windows, uint pid)

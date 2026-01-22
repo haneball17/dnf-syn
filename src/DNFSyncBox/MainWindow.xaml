@@ -1,7 +1,7 @@
 <Window x:Class="DNFSyncBox.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="DNF Sync Box (MVP)" Height="420" Width="520">
+        Title="DNF Sync Box" Height="420" Width="520">
   <Grid Margin="12">
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto" />
@@ -26,7 +26,7 @@
       <ListBox Name="LogList" />
     </GroupBox>
 
-    <TextBlock Grid.Row="3" Margin="0,8,0,0" Foreground="Gray"
-               Text="热键：Alt + .  |  仅同步方向键（MVP）" />
+      <TextBlock Grid.Row="3" Margin="0,8,0,0" Foreground="Gray"
+               Text="热键：Alt + .  |  方案可配置（共享内存伪造）" />
   </Grid>
 </Window>

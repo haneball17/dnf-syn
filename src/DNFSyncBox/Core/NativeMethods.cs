@@ -79,6 +79,11 @@ internal static class NativeMethods
     [DllImport("user32.dll")]
     public static extern uint MapVirtualKey(uint uCode, uint uMapType);
 
+    // 获取键盘状态（256 字节，低位为切换态）
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetKeyboardState(byte[] lpKeyState);
+
     // 前台窗口句柄
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
