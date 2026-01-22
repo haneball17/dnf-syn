@@ -974,7 +974,36 @@ static BOOL WINAPI Hook_RegisterRawInputDevices(PCRAWINPUTDEVICE devices, UINT n
 static UINT WINAPI Hook_GetRawInputData(HRAWINPUT hRawInput, UINT command, LPVOID data, PUINT size, UINT headerSize)
 {
     InterlockedIncrement(&g_countGetRawInputData);
-    return g_origGetRawInputData ? g_origGetRawInputData(hRawInput, command, data, size, headerSize) : 0;
+    if (!g_origGetRawInputData)
+    {
+        return 0;
+    }
+
+    UINT result = g_origGetRawInputData(hRawInput, command, data, size, headerSize);
+
+    // 仅记录键盘 RawInput，便于判定按键是否只通过 RawInput 进入 DNF。
+    if (result > 0 && command == RID_INPUT && data && size && *size >= sizeof(RAWINPUT))
+    {
+        const RAWINPUT* raw = static_cast<const RAWINPUT*>(data);
+        if (raw->header.dwType == RIM_TYPEKEYBOARD)
+        {
+            const RAWKEYBOARD& kb = raw->data.keyboard;
+            wchar_t buffer[256] = {0};
+            StringCchPrintfW(
+                buffer,
+                ARRAYSIZE(buffer),
+                L"[RAW] %s RawInput 键盘: VKey=%u(0x%02X) MakeCode=%u(0x%02X) Flags=0x%X",
+                GetTimestamp().c_str(),
+                kb.VKey,
+                kb.VKey,
+                kb.MakeCode,
+                kb.MakeCode,
+                kb.Flags);
+            WriteLogLine(buffer);
+        }
+    }
+
+    return result;
 }
 
 static HWND WINAPI Hook_GetForegroundWindow()
