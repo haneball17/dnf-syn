@@ -133,13 +133,20 @@ internal sealed class KeyboardProfileManager
         var mode = ParseMode(activeDefinition.Mode);
         var keys = ParseKeys(activeDefinition.Keys, warnings);
         var mappings = ParseMappings(activeDefinition.Mappings, warnings);
+        var mappingBehavior = ParseMappingBehavior(activeDefinition.MappingBehavior, warnings);
 
         if (mode == KeyboardProfileMode.Mapping && mappings.Count == 0)
         {
             warnings.Add("映射方案未配置有效映射，已按空映射处理。");
         }
 
-        return new KeyboardProfile(activeDefinition.Id, mode, keys, mappings);
+        if (mappingBehavior != KeyboardMappingBehavior.None && mappings.Count == 0)
+        {
+            warnings.Add("映射行为已配置但无有效映射，已忽略映射行为。");
+            mappingBehavior = KeyboardMappingBehavior.None;
+        }
+
+        return new KeyboardProfile(activeDefinition.Id, mode, keys, mappings, mappingBehavior);
     }
 
     private static KeyboardProfileMode ParseMode(string? text)
@@ -151,6 +158,22 @@ internal sealed class KeyboardProfileManager
         }
 
         return KeyboardProfileMode.All;
+    }
+
+    private static KeyboardMappingBehavior ParseMappingBehavior(string? text, List<string> warnings)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return KeyboardMappingBehavior.None;
+        }
+
+        if (Enum.TryParse<KeyboardMappingBehavior>(text, true, out var behavior))
+        {
+            return behavior;
+        }
+
+        warnings.Add($"无效映射行为:{text}");
+        return KeyboardMappingBehavior.None;
     }
 
     private static List<int> ParseKeys(List<string>? keys, List<string> warnings)
@@ -229,6 +252,18 @@ internal sealed class KeyboardProfileManager
 
     private static KeyboardProfile CreateDefaultProfile()
     {
-        return new KeyboardProfile("full", KeyboardProfileMode.All, Array.Empty<int>(), Array.Empty<KeyboardProfile.KeyMapping>());
+        return new KeyboardProfile(
+            "all_except_f12",
+            KeyboardProfileMode.Blacklist,
+            new[] { (int)Keys.F12 },
+            new[]
+            {
+                new KeyboardProfile.KeyMapping((int)Keys.Q, (int)Keys.Oem4),
+                new KeyboardProfile.KeyMapping((int)Keys.D, (int)Keys.L),
+                new KeyboardProfile.KeyMapping((int)Keys.F, (int)Keys.OemSemicolon),
+                new KeyboardProfile.KeyMapping((int)Keys.G, (int)Keys.Oem7),
+                new KeyboardProfile.KeyMapping((int)Keys.C, (int)Keys.Oem6)
+            },
+            KeyboardMappingBehavior.Replace);
     }
 }

@@ -151,14 +151,30 @@
   - Whitelist：仅伪造 keys 中列出的键
   - Blacklist：伪造除 keys 外的所有键
   - Mapping：将 mappings 中的源键映射到目标键
+- mappingBehavior（可选）：
+  - None：不启用覆盖式映射（默认）
+  - Replace：在非 Mapping 模式下将源键替换为目标键输出
 - 键名使用 System.Windows.Forms.Keys 枚举名称（大小写不敏感）
 
 **配置示例：**
 
 ```json
 {
-  "activeProfile": "full",
+  "activeProfile": "all_except_f12",
   "profiles": [
+    {
+      "id": "all_except_f12",
+      "mode": "Blacklist",
+      "keys": ["F12"],
+      "mappings": {
+        "Q": "Oem4",
+        "D": "L",
+        "F": "OemSemicolon",
+        "G": "Oem7",
+        "C": "Oem6"
+      },
+      "mappingBehavior": "Replace"
+    },
     { "id": "full", "mode": "All" },
     { "id": "wasd", "mode": "Whitelist", "keys": ["W", "A", "S", "D", "Space"] },
     { "id": "arrows", "mode": "Blacklist", "keys": ["F1", "F2", "F3"] },
@@ -168,9 +184,10 @@
 ```
 
 **加载规则：**
-- 配置不存在时会自动生成默认配置（full/All）。
+- 配置不存在时会自动生成默认配置（all_except_f12/Blacklist + Replace 映射）。
 - 键名解析使用 Enum.TryParse<Keys>(ignoreCase:true)，非法键名会被忽略并记录日志。
 - Mapping 模式仅伪造映射目标键，源键本身不会被透传。
+- Replace 模式在非 Mapping 下生效：源键被替换为目标键输出，源键本身被屏蔽。
 
 ## 4. 详细开发步骤 (Step-by-Step)
 
