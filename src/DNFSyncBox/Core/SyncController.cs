@@ -30,6 +30,7 @@ public sealed class SyncController : IDisposable
     private readonly byte[] _keyboardState = new byte[SharedMemoryConstants.KeyCount];
     private readonly uint[] _edgeCounter = new uint[SharedMemoryConstants.KeyCount];
     private readonly byte[] _targetMask = new byte[SharedMemoryConstants.KeyCount];
+    private readonly byte[] _blockMask = new byte[SharedMemoryConstants.KeyCount];
     private readonly byte[] _toggleState = new byte[SharedMemoryConstants.KeyCount];
 
     private WindowSnapshot _snapshot = WindowSnapshot.Empty;
@@ -309,10 +310,12 @@ public sealed class SyncController : IDisposable
                 Array.Clear(_keyboardState, 0, _keyboardState.Length);
                 _keyState.CopyEdgeCounters(_edgeCounter);
                 profile.BuildMask(_targetMask);
+                profile.BuildBlockMask(_blockMask);
             }
             else
             {
                 _keyState.ApplyProfile(profile, _toggleState, _keyboardState, _edgeCounter, _targetMask);
+                profile.BuildBlockMask(_blockMask);
             }
         }
 
@@ -325,15 +328,24 @@ public sealed class SyncController : IDisposable
         var activePid = snapshot.ForegroundIsDnf ? snapshot.ForegroundProcessId : 0u;
         var tick = (ulong)Environment.TickCount64;
 
+        // Replace 映射依赖 RawInput 事件路径；上报 Mapping 模式可触发注入端生成映射事件。
+        var reportedMode = profile.Mode;
+        if (reportedMode != KeyboardProfileMode.Mapping &&
+            profile.MappingBehavior == KeyboardMappingBehavior.Replace)
+        {
+            reportedMode = KeyboardProfileMode.Mapping;
+        }
+
         _sharedMemory.PublishSnapshot(
             flags,
             activePid,
             profile.ProfileId,
-            (uint)profile.Mode,
+            (uint)reportedMode,
             tick,
             _keyboardState,
             _edgeCounter,
-            _targetMask);
+            _targetMask,
+            _blockMask);
     }
 
     /// <summary>

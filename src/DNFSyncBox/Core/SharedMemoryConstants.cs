@@ -5,8 +5,8 @@ namespace DNFSyncBox;
 /// </summary>
 internal static unsafe class SharedMemoryConstants
 {
-    public const string MappingName = "Local\\DNFSyncBox.KeyboardState.V1";
-    public const uint Version = 1;
+    public const string MappingName = "Local\\DNFSyncBox.KeyboardState.V2";
+    public const uint Version = 2;
     public const int KeyCount = 256;
 
     public const uint FlagPaused = 0x1;
@@ -14,5 +14,5 @@ internal static unsafe class SharedMemoryConstants
 
     public const int HeartbeatIntervalMs = 50;
 
-    public static int SharedMemorySize => sizeof(SharedKeyboardStateV1);
+    public static int SharedMemorySize => sizeof(SharedKeyboardStateV2);
 }

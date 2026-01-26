@@ -9,6 +9,7 @@
 #include <string>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 #include <cwctype>
 
 #include "MinHook.h"
@@ -54,16 +55,19 @@ static LONG g_deviceHooksHooked = 0;
 // 共享内存与伪造配置
 // ------------------------------
 
-static const wchar_t* kSharedMemoryName = L"Local\\DNFSyncBox.KeyboardState.V1";
-static const uint32_t kSharedVersion = 1;
+static const wchar_t* kSharedMemoryName = L"Local\\DNFSyncBox.KeyboardState.V2";
+static const uint32_t kSharedVersion = 2;
 static const uint32_t kFlagPaused = 0x1;
 static const uint32_t kFlagClear = 0x2;
 static const ULONGLONG kSharedTimeoutMs = 200;
-// 与控制端 KeyboardProfileMode 枚举保持一致（Mapping=3）。
+// 与控制端 KeyboardProfileMode 枚举保持一致（Blacklist=2，Mapping=3）。
 static const uint32_t kProfileModeMapping = 3;
+// 伪造延迟（毫秒），用于在注入后短暂关闭输入伪造以降低崩溃风险。
+static const wchar_t* kSpoofDelayEnvName = L"DNFSYNC_SPOOF_DELAY_MS";
+static const DWORD kDefaultSpoofDelayMs = 5000;
 
 #pragma pack(push, 1)
-struct SharedKeyboardStateV1
+struct SharedKeyboardStateV2
 {
     uint32_t version;
     uint32_t seq;
@@ -75,6 +79,7 @@ struct SharedKeyboardStateV1
     uint8_t keyboardState[256];
     uint32_t edgeCounter[256];
     uint8_t targetMask[256];
+    uint8_t blockMask[256];
 };
 #pragma pack(pop)
 
@@ -89,10 +94,11 @@ struct SharedSnapshot
     uint8_t keyboardState[256];
     uint32_t edgeCounter[256];
     uint8_t targetMask[256];
+    uint8_t blockMask[256];
 };
 
 static HANDLE g_sharedMapping = nullptr;
-static SharedKeyboardStateV1* g_sharedState = nullptr;
+static SharedKeyboardStateV2* g_sharedState = nullptr;
 static DWORD g_lastSharedAttemptTick = 0;
 static LONG g_sharedReadyLogged = 0;
 static LONG g_sharedErrorLogged = 0;
@@ -116,6 +122,10 @@ static LONG g_forceDeviceStateLogged = 0;
 
 static HWND g_selfWindowCache = nullptr;
 static DWORD g_selfWindowCacheTick = 0;
+static ULONGLONG g_injectTick = 0;
+static LONG g_spoofDelayMs = -1;
+static LONG g_spoofDelayLogged = 0;
+static LONG g_spoofDelayEndLogged = 0;
 
 // ------------------------------
 // MinHook 目标函数指针
@@ -182,7 +192,7 @@ static Poll_t g_origPoll = nullptr;
 // 日志工具（UTF-8）
 // ------------------------------
 
-static std::wstring BuildLogPath()
+static std::wstring GetModuleDirectory()
 {
     std::wstring baseDir;
     wchar_t modulePath[MAX_PATH] = {0};
@@ -213,8 +223,17 @@ static std::wstring BuildLogPath()
         }
     }
 
+    return baseDir.empty() ? L"." : baseDir;
+}
+
+static std::wstring BuildLogPath()
+{
+    // 日志统一输出到 DLL 所在目录的 logs 子目录。
+    std::wstring baseDir = GetModuleDirectory();
+    std::wstring logDir = baseDir + L"\\logs";
+
     wchar_t fileName[MAX_PATH] = {0};
-    StringCchPrintfW(fileName, ARRAYSIZE(fileName), L"%s\\dnfinput_%lu.log", baseDir.c_str(), GetCurrentProcessId());
+    StringCchPrintfW(fileName, ARRAYSIZE(fileName), L"%s\\dnfinput_%lu.log", logDir.c_str(), GetCurrentProcessId());
     return std::wstring(fileName);
 }
 
@@ -253,9 +272,8 @@ static std::wstring GetModuleBaseName()
 
 static std::wstring BuildSuccessFilePath()
 {
-    std::wstring logPath = BuildLogPath();
-    size_t slash = logPath.rfind(L'\\');
-    std::wstring logDir = slash == std::wstring::npos ? L"." : logPath.substr(0, slash);
+    // success file 仍放在 DLL 所在目录，便于外部工具检测。
+    std::wstring logDir = GetModuleDirectory();
     std::wstring dllName = GetModuleBaseName();
     std::wstring fileName = L"successfile_" + dllName + L"_" + std::to_wstring(GetCurrentProcessId()) + L".txt";
     return logDir + L"\\" + fileName;
@@ -420,6 +438,13 @@ static void InitializeLogging()
     InitializeCriticalSection(&g_logLock);
 
     std::wstring path = BuildLogPath();
+    size_t slash = path.rfind(L'\\');
+    if (slash != std::wstring::npos)
+    {
+        std::wstring logDir = path.substr(0, slash);
+        // 允许目录已存在，失败时继续走默认写入逻辑。
+        CreateDirectoryW(logDir.c_str(), nullptr);
+    }
     g_logFile = CreateFileW(
         path.c_str(),
         FILE_APPEND_DATA,
@@ -596,7 +621,7 @@ static bool EnsureSharedMemory()
         return false;
     }
 
-    void* view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, sizeof(SharedKeyboardStateV1));
+    void* view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, sizeof(SharedKeyboardStateV2));
     if (!view)
     {
         CloseHandle(mapping);
@@ -604,7 +629,7 @@ static bool EnsureSharedMemory()
     }
 
     g_sharedMapping = mapping;
-    g_sharedState = static_cast<SharedKeyboardStateV1*>(view);
+    g_sharedState = static_cast<SharedKeyboardStateV2*>(view);
 
     if (InterlockedCompareExchange(&g_sharedReadyLogged, 1, 0) == 0)
     {
@@ -647,6 +672,7 @@ static bool ReadSharedSnapshot(SharedSnapshot& snapshot)
         memcpy(snapshot.keyboardState, g_sharedState->keyboardState, sizeof(snapshot.keyboardState));
         memcpy(snapshot.edgeCounter, g_sharedState->edgeCounter, sizeof(snapshot.edgeCounter));
         memcpy(snapshot.targetMask, g_sharedState->targetMask, sizeof(snapshot.targetMask));
+        memcpy(snapshot.blockMask, g_sharedState->blockMask, sizeof(snapshot.blockMask));
 
         uint32_t seq2 = g_sharedState->seq;
         if (seq1 == seq2 && (seq2 & 1) == 0)
@@ -701,7 +727,22 @@ static void BuildRawKeyboardEvent(int vKey, bool isDown, RAWKEYBOARD& keyboard)
     // MapVirtualKeyW 的扩展键会在高位标记，RawInput 需要 RI_KEY_E0/E1。
     UINT scan = MapVirtualKeyW(static_cast<UINT>(vKey), MAPVK_VK_TO_VSC_EX);
     USHORT flags = 0;
-    if ((scan & 0x100) != 0)
+    // 某些扩展键（例如方向键）在部分环境下不会带 0x100，导致缺少 E0 标记。
+    // 这里兜底补齐，避免后台把方向键当成小键盘键处理。
+    bool isExtended = (scan & 0x100) != 0;
+    if (!isExtended)
+    {
+        switch (vKey)
+        {
+            case VK_LEFT:
+            case VK_UP:
+            case VK_RIGHT:
+            case VK_DOWN:
+                isExtended = true;
+                break;
+        }
+    }
+    if (isExtended)
     {
         flags |= RI_KEY_E0;
     }
@@ -818,6 +859,22 @@ static bool IsBypassProcess(const SharedSnapshot& snapshot)
     return snapshot.activePid == GetCurrentProcessId();
 }
 
+static bool ShouldBlockKey(const SharedSnapshot& snapshot, int vKey, bool alive, bool paused)
+{
+    // 仅对控制端显式标记的拦截键生效，避免误伤非黑名单键。
+    if (vKey < 0 || vKey >= 256)
+    {
+        return false;
+    }
+
+    if (!alive || paused)
+    {
+        return false;
+    }
+
+    return snapshot.blockMask[vKey] != 0;
+}
+
 static void EnsureVkeyToDikMap()
 {
     // DirectInput 键盘使用 DIK 扫描码索引 256 字节状态数组，这里把 vKey 映射到 DIK
@@ -872,6 +929,99 @@ static bool ShouldForceDeviceStateOk()
 
     InterlockedExchange(&g_forceDeviceStateOk, enabled ? 1 : 0);
     return enabled;
+}
+
+/// <summary>
+/// 读取伪造延迟配置（单位毫秒），用于注入后短时间禁止伪造。
+/// </summary>
+static DWORD GetSpoofDelayMs()
+{
+    LONG cached = InterlockedCompareExchange(&g_spoofDelayMs, -1, -1);
+    if (cached != -1)
+    {
+        return static_cast<DWORD>(cached);
+    }
+
+    DWORD delay = kDefaultSpoofDelayMs;
+    wchar_t value[16] = {0};
+    DWORD len = GetEnvironmentVariableW(kSpoofDelayEnvName, value, ARRAYSIZE(value));
+    if (len > 0)
+    {
+        wchar_t* end = nullptr;
+        unsigned long parsed = wcstoul(value, &end, 10);
+        if (end != value)
+        {
+            if (parsed > 600000)
+            {
+                parsed = 600000;
+            }
+            delay = static_cast<DWORD>(parsed);
+        }
+    }
+
+    InterlockedExchange(&g_spoofDelayMs, static_cast<LONG>(delay));
+    return delay;
+}
+
+/// <summary>
+/// 初始化伪造延迟时间戳并记录日志。
+/// </summary>
+static void InitializeSpoofDelay()
+{
+    if (g_injectTick == 0)
+    {
+        g_injectTick = GetTickCount64();
+    }
+
+    DWORD delay = GetSpoofDelayMs();
+    if (delay == 0)
+    {
+        LogInfo(L"伪造延迟已关闭（DNFSYNC_SPOOF_DELAY_MS=0）");
+        return;
+    }
+
+    if (InterlockedCompareExchange(&g_spoofDelayLogged, 1, 0) == 0)
+    {
+        wchar_t buffer[160] = {0};
+        StringCchPrintfW(
+            buffer,
+            ARRAYSIZE(buffer),
+            L"伪造延迟已启用：%lu ms（环境变量 %s）",
+            delay,
+            kSpoofDelayEnvName);
+        LogInfo(buffer);
+    }
+}
+
+/// <summary>
+/// 判断伪造延迟是否仍然生效，生效期间必须完全停止伪造。
+/// </summary>
+static bool IsSpoofDelayActive()
+{
+    DWORD delay = GetSpoofDelayMs();
+    if (delay == 0)
+    {
+        return false;
+    }
+
+    ULONGLONG start = g_injectTick;
+    if (start == 0)
+    {
+        return false;
+    }
+
+    ULONGLONG now = GetTickCount64();
+    if (now - start < delay)
+    {
+        return true;
+    }
+
+    if (InterlockedCompareExchange(&g_spoofDelayEndLogged, 1, 0) == 0)
+    {
+        LogInfo(L"伪造延迟结束，开始启用输入伪造");
+    }
+
+    return false;
 }
 
 struct WindowSearchContext
@@ -956,6 +1106,11 @@ static bool IsWindowOwnedBySelf(HWND hwnd)
 
 static bool ShouldSpoofFocus()
 {
+    if (IsSpoofDelayActive())
+    {
+        return false;
+    }
+
     // 仅在后台且共享内存存活/未暂停时伪造焦点，避免影响前台与暂停态。
     SharedSnapshot snapshot = {};
     if (!ReadSharedSnapshot(snapshot))
@@ -1056,6 +1211,11 @@ static SHORT WINAPI Hook_GetAsyncKeyState(int vKey)
         return original;
     }
 
+    if (IsSpoofDelayActive())
+    {
+        return original;
+    }
+
     SharedSnapshot snapshot = {};
     if (!ReadSharedSnapshot(snapshot))
     {
@@ -1071,10 +1231,14 @@ static SHORT WINAPI Hook_GetAsyncKeyState(int vKey)
 
     const bool alive = IsSnapshotAlive(snapshot);
     const bool paused = (snapshot.flags & kFlagPaused) != 0;
-    const bool shouldOverride = snapshot.targetMask[vKey] != 0;
 
-    if (!shouldOverride)
+    if (snapshot.targetMask[vKey] == 0)
     {
+        if (ShouldBlockKey(snapshot, vKey, alive, paused))
+        {
+            return 0;
+        }
+
         return original;
     }
 
@@ -1115,6 +1279,11 @@ static BOOL WINAPI Hook_GetKeyboardState(PBYTE lpKeyState)
         return ok;
     }
 
+    if (IsSpoofDelayActive())
+    {
+        return ok;
+    }
+
     SharedSnapshot snapshot = {};
     if (!ReadSharedSnapshot(snapshot))
     {
@@ -1134,21 +1303,27 @@ static BOOL WINAPI Hook_GetKeyboardState(PBYTE lpKeyState)
 
     for (int i = 0; i < 256; i++)
     {
-        if (snapshot.targetMask[i] == 0)
+        if (snapshot.targetMask[i] != 0)
         {
-            continue;
-        }
+            if (!alive || paused)
+            {
+                lpKeyState[i] &= static_cast<BYTE>(~0x81);
+                spoofed = true;
+                continue;
+            }
 
-        if (!alive || paused)
-        {
-            lpKeyState[i] &= static_cast<BYTE>(~0x81);
+            BYTE desired = snapshot.keyboardState[i];
+            lpKeyState[i] = (lpKeyState[i] & static_cast<BYTE>(~0x81)) | (desired & 0x81);
             spoofed = true;
             continue;
         }
 
-        BYTE desired = snapshot.keyboardState[i];
-        lpKeyState[i] = (lpKeyState[i] & static_cast<BYTE>(~0x81)) | (desired & 0x81);
-        spoofed = true;
+        if (ShouldBlockKey(snapshot, i, alive, paused))
+        {
+            // 拦截键在同步生效时强制抬起，避免后台继续读到真实输入。
+            lpKeyState[i] &= static_cast<BYTE>(~0x81);
+            spoofed = true;
+        }
     }
 
     if (spoofed)
@@ -1179,6 +1354,11 @@ static UINT WINAPI Hook_GetRawInputBuffer(PRAWINPUT data, PUINT size, UINT heade
         return count;
     }
 
+    if (IsSpoofDelayActive())
+    {
+        return count;
+    }
+
     InterlockedExchange(&g_seenRawInputBuffer, 1);
 
     SharedSnapshot snapshot = {};
@@ -1201,28 +1381,34 @@ static UINT WINAPI Hook_GetRawInputBuffer(PRAWINPUT data, PUINT size, UINT heade
                 const bool alive = IsSnapshotAlive(snapshot);
                 const bool paused = (snapshot.flags & kFlagPaused) != 0;
 
-                if (snapshot.profileMode == kProfileModeMapping)
-                {
-                    // 映射模式下用目标键序列重写 RawInput，确保后台能收到映射后的按键事件。
-                    int vKey = 0;
-                    bool isDown = false;
+                    if (snapshot.profileMode == kProfileModeMapping)
+                    {
+                        // 映射模式下用目标键序列重写 RawInput，确保后台能收到映射后的按键事件。
+                        int vKey = 0;
+                        bool isDown = false;
                     if (TryPickMappingRawKey(snapshot, alive, paused, &vKey, &isDown))
                     {
                         BuildRawKeyboardEvent(vKey, isDown, raw->data.keyboard);
                         spoofed = true;
                     }
-                }
-                else
-                {
-                    int vKey = static_cast<int>(raw->data.keyboard.VKey);
-                    if (vKey >= 0 && vKey < 256 && snapshot.targetMask[vKey] != 0)
+                    }
+                    else
                     {
-                        if (!alive || paused)
+                        int vKey = static_cast<int>(raw->data.keyboard.VKey);
+                        if (vKey >= 0 && vKey < 256)
                         {
-                            // 暂停或失联时强制抬起，避免后台继续响应真实输入。
-                            g_lastRawKeyboardState[vKey] = 0;
-                            BuildRawKeyboardEvent(vKey, false, raw->data.keyboard);
-                            spoofed = true;
+                            if (ShouldBlockKey(snapshot, vKey, alive, paused))
+                            {
+                                g_lastRawKeyboardState[vKey] = 0;
+                                BuildRawKeyboardEvent(vKey, false, raw->data.keyboard);
+                                spoofed = true;
+                            }
+                            else if (snapshot.targetMask[vKey] != 0 && (!alive || paused))
+                            {
+                                // 暂停或失联时强制抬起，避免后台继续响应真实输入。
+                                g_lastRawKeyboardState[vKey] = 0;
+                                BuildRawKeyboardEvent(vKey, false, raw->data.keyboard);
+                                spoofed = true;
                         }
                     }
                 }
@@ -1265,6 +1451,11 @@ static UINT WINAPI Hook_GetRawInputData(HRAWINPUT hRawInput, UINT command, LPVOI
 
     UINT result = g_origGetRawInputData(hRawInput, command, data, size, headerSize);
 
+    if (IsSpoofDelayActive())
+    {
+        return result;
+    }
+
     // RawInput 键盘数据大小通常小于 sizeof(RAWINPUT)，必须以 header->dwSize 判定。
     const bool allowDataSpoof = InterlockedCompareExchange(&g_seenRawInputBuffer, 1, 1) == 0;
     if (result > 0 && command == RID_INPUT && data && size && *size >= sizeof(RAWINPUTHEADER))
@@ -1303,26 +1494,35 @@ static UINT WINAPI Hook_GetRawInputData(HRAWINPUT hRawInput, UINT command, LPVOI
                     {
                         // 非映射模式：仅对目标键按“期望状态”修正 Make/Break，避免吞键。
                         int vKey = static_cast<int>(raw->data.keyboard.VKey);
-                        if (vKey >= 0 && vKey < 256 && snapshot.targetMask[vKey] != 0)
+                        if (vKey >= 0 && vKey < 256)
                         {
-                            const bool desiredDown = alive && !paused && (snapshot.keyboardState[vKey] & 0x80) != 0;
-                            const bool rawDown = (raw->data.keyboard.Flags & RI_KEY_BREAK) == 0;
-
-                            if (allowDataSpoof)
+                            if (ShouldBlockKey(snapshot, vKey, alive, paused))
                             {
-                                if (desiredDown != rawDown)
-                                {
-                                    BuildRawKeyboardEvent(vKey, desiredDown, raw->data.keyboard);
-                                    spoofed = true;
-                                }
-                                g_lastRawKeyboardState[vKey] = desiredDown ? 0x80 : 0x00;
-                            }
-                            else if (!desiredDown && rawDown)
-                            {
-                                // 当 RawInputBuffer 已在使用时，只在暂停/失联时兜底抬起。
                                 BuildRawKeyboardEvent(vKey, false, raw->data.keyboard);
                                 spoofed = true;
                                 g_lastRawKeyboardState[vKey] = 0;
+                            }
+                            else if (snapshot.targetMask[vKey] != 0)
+                            {
+                                const bool desiredDown = alive && !paused && (snapshot.keyboardState[vKey] & 0x80) != 0;
+                                const bool rawDown = (raw->data.keyboard.Flags & RI_KEY_BREAK) == 0;
+
+                                if (allowDataSpoof)
+                                {
+                                    if (desiredDown != rawDown)
+                                    {
+                                        BuildRawKeyboardEvent(vKey, desiredDown, raw->data.keyboard);
+                                        spoofed = true;
+                                    }
+                                    g_lastRawKeyboardState[vKey] = desiredDown ? 0x80 : 0x00;
+                                }
+                                else if (!desiredDown && rawDown)
+                                {
+                                    // 当 RawInputBuffer 已在使用时，只在暂停/失联时兜底抬起。
+                                    BuildRawKeyboardEvent(vKey, false, raw->data.keyboard);
+                                    spoofed = true;
+                                    g_lastRawKeyboardState[vKey] = 0;
+                                }
                             }
                         }
                     }
@@ -1526,6 +1726,11 @@ static HRESULT STDMETHODCALLTYPE Hook_GetDeviceState(IDirectInputDevice8W* devic
         return hr;
     }
 
+    if (IsSpoofDelayActive())
+    {
+        return hr;
+    }
+
     SharedSnapshot snapshot = {};
     if (!ReadSharedSnapshot(snapshot))
     {
@@ -1548,26 +1753,29 @@ static HRESULT STDMETHODCALLTYPE Hook_GetDeviceState(IDirectInputDevice8W* devic
 
     for (int vKey = 0; vKey < 256; vKey++)
     {
-        if (snapshot.targetMask[vKey] == 0)
-        {
-            continue;
-        }
-
         int dik = g_vkeyToDik[vKey];
         if (dik < 0 || dik >= 256)
         {
             continue;
         }
 
-        if (!alive || paused)
+        if (snapshot.targetMask[vKey] != 0)
+        {
+            if (!alive || paused)
+            {
+                state[dik] = 0;
+                spoofed = true;
+                continue;
+            }
+
+            state[dik] = (snapshot.keyboardState[vKey] & 0x80) ? 0x80 : 0x00;
+            spoofed = true;
+        }
+        else if (ShouldBlockKey(snapshot, vKey, alive, paused))
         {
             state[dik] = 0;
             spoofed = true;
-            continue;
         }
-
-        state[dik] = (snapshot.keyboardState[vKey] & 0x80) ? 0x80 : 0x00;
-        spoofed = true;
     }
 
     if (spoofed)
@@ -1977,6 +2185,7 @@ static DWORD WINAPI WorkerThread(LPVOID)
     InitializeLogging();
     // 成功文件写入：避免在 DllMain 中做 I/O，降低 Loader Lock 风险
     WriteSuccessFile();
+    InitializeSpoofDelay();
 
     LogInfo(L"工作线程启动，准备初始化 MinHook 与输入路径统计");
 
@@ -1993,6 +2202,8 @@ static DWORD WINAPI WorkerThread(LPVOID)
 
     LogInfo(L"Hook 安装完成，开始统计调用频率");
 
+    // 暂时禁用抹头逻辑，便于调试与稳定性验证。
+#if 0
     // 抹头放在 Hook 初始化之后，避免影响需要解析 PE 的逻辑
     if (ErasePeHeader(g_module))
     {
@@ -2002,6 +2213,7 @@ static DWORD WINAPI WorkerThread(LPVOID)
     {
         LogError(L"抹头失败或被跳过");
     }
+#endif
 
     while (InterlockedCompareExchange(&g_shouldStop, 0, 0) == 0)
     {
@@ -2023,6 +2235,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     {
         // 关键点：DllMain 内只做最小动作，避免触发 Loader Lock 风险
         g_module = module;
+        // 记录注入时间，用于伪造延迟计时。
+        g_injectTick = GetTickCount64();
         DisableThreadLibraryCalls(module);
 
         // 断链：降低被模块枚举发现的概率

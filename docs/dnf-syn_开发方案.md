@@ -1,6 +1,6 @@
 # dnf-syn_开发方案
 
-**版本：** 1.2
+**版本：** 1.5
 **技术栈：** C# / .NET 8 (WPF)
 **目标：** 实现前台窗口输入操作对后台窗口的实时同步，专用于 2012版 DNF 客户端。
 
@@ -75,8 +75,9 @@
 关键要点：
 - 目录：`dnfinput/`，输出 `dnfinput.dll`（x86）
 - Hook 库：MinHook（已纳入 `dnfinput/third_party/`）
-- 日志：`<dnfinput.dll 所在目录>\\dnfinput_<pid>.log`
+- 日志：`<dnfinput.dll 所在目录>\\logs\\dnfinput_<pid>.log`
 - 成功标记：`<dnfinput.dll 所在目录>\\successfile_dnfinput_<pid>.txt`（进程退出自动删除）
+- 伪造延迟：环境变量 `DNFSYNC_SPOOF_DELAY_MS`（默认 5000ms），注入后延迟期内仅统计不伪造
 
 构建命令（示例）：
 1. `cmake -S "dnfinput" -B "dnfinput/build" -A Win32`
@@ -93,12 +94,14 @@
   - `keyboardState` 的 `0x80` 表示按下状态。  
   - `edgeCounter` 用于生成低位语义（与注入端本地缓存比较）。  
 - `GetKeyboardState` 先取真实状态，再仅覆盖目标键的 `0x80/0x01`，避免干扰非目标键。  
+- **Blacklist 模式**：黑名单键在同步生效时强制抬起，避免真实输入穿透。  
 - 失联或暂停时强制清键，防止后台卡键。  
 
 ### 3.1.1 DirectInput（GetDeviceState）伪造语义
 
 - DirectInput 键盘状态固定 256 字节数组（DIK 扫描码索引）。
-- 先透传原始状态，再对 `targetMask` 命中的键覆盖 `0x80` 按下位。
+- 先透传原始状态，再对 `targetMask` 命中的键覆盖 `0x80` 按下位。  
+- **BlockMask**：用于强制拦截黑名单键（例如 F12），即使上报为 Mapping 模式也生效。  
 - vKey → DIK 使用 `MapVirtualKeyW(MAPVK_VK_TO_VSC_EX)` 映射，扩展键补 `0x80`。
 - 失联/暂停时对目标键强制清零，避免后台卡键。
 
@@ -106,6 +109,7 @@
 
 - 仅处理键盘 RawInput（`RIM_TYPEKEYBOARD`），避免影响鼠标/其他 HID。
 - 读取共享内存快照，根据 `targetMask` 与 `keyboardState` 对目标键修正
+- 读取 `blockMask`，对黑名单键强制抬起，防止真实输入穿透
   `Make/Break`（仅在期望状态与事件不一致时改写），减少吞键风险。
 - 暂停或失联时对目标键输出抬起（Break），避免后台卡键或继续响应。
 - Mapping 模式使用目标键序列重写事件，确保源键映射到目标键后仍能生效。
@@ -149,7 +153,7 @@
 - mode 支持：
   - All：全键伪造
   - Whitelist：仅伪造 keys 中列出的键
-  - Blacklist：伪造除 keys 外的所有键
+  - Blacklist：伪造除 keys 外的所有键（黑名单键在同步生效时强制抬起）
   - Mapping：将 mappings 中的源键映射到目标键
 - mappingBehavior（可选）：
   - None：不启用覆盖式映射（默认）
@@ -188,6 +192,8 @@
 - 键名解析使用 Enum.TryParse<Keys>(ignoreCase:true)，非法键名会被忽略并记录日志。
 - Mapping 模式仅伪造映射目标键，源键本身不会被透传。
 - Replace 模式在非 Mapping 下生效：源键被替换为目标键输出，源键本身被屏蔽。
+- **Replace + RawInput**：为保证映射在 RawInput 下可用，会向注入端上报 `profileMode=Mapping`，
+  以触发“生成映射事件”的路径；日志中的 Mode 将显示为 3。
 
 ## 4. 详细开发步骤 (Step-by-Step)
 
@@ -208,7 +214,7 @@
 2. `KeyStateTracker` 记录按键状态与去重。
 
 ### 第四阶段：共享内存与伪造
-1. 设计共享内存结构（seq、keyboardState、edgeCounter、targetMask 等）。
+1. 设计共享内存结构（seq、keyboardState、edgeCounter、targetMask、blockMask 等）。
 2. UI 写入快照并维持心跳（GetTickCount64）。
 3. dnfinput Hook `GetAsyncKeyState` / `GetKeyboardState` 读取快照并伪造。
 

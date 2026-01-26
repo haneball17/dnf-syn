@@ -38,7 +38,7 @@ internal sealed unsafe class SharedMemoryWriter : IDisposable
         _initialized = true;
 
         new Span<byte>(_basePtr, SharedMemoryConstants.SharedMemorySize).Clear();
-        var shared = (SharedKeyboardStateV1*)_basePtr;
+        var shared = (SharedKeyboardStateV2*)_basePtr;
         shared->Version = SharedMemoryConstants.Version;
     }
 
@@ -53,14 +53,15 @@ internal sealed unsafe class SharedMemoryWriter : IDisposable
         ulong lastTick,
         byte[] keyboardState,
         uint[] edgeCounter,
-        byte[] targetMask)
+        byte[] targetMask,
+        byte[] blockMask)
     {
         if (!_initialized)
         {
             return;
         }
 
-        var shared = (SharedKeyboardStateV1*)_basePtr;
+        var shared = (SharedKeyboardStateV2*)_basePtr;
         var seq = shared->Seq + 1;
         if ((seq & 1) == 0)
         {
@@ -97,6 +98,15 @@ internal sealed unsafe class SharedMemoryWriter : IDisposable
             Buffer.MemoryCopy(
                 srcMask,
                 shared->TargetMask,
+                SharedMemoryConstants.KeyCount,
+                SharedMemoryConstants.KeyCount);
+        }
+
+        fixed (byte* srcBlock = blockMask)
+        {
+            Buffer.MemoryCopy(
+                srcBlock,
+                shared->BlockMask,
                 SharedMemoryConstants.KeyCount,
                 SharedMemoryConstants.KeyCount);
         }

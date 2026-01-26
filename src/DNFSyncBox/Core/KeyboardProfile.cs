@@ -102,6 +102,27 @@ internal sealed class KeyboardProfile
     }
 
     /// <summary>
+    /// 根据方案生成强制拦截掩码（1 表示强制抬起该键）。
+    /// </summary>
+    public void BuildBlockMask(byte[] blockMaskOut)
+    {
+        Array.Clear(blockMaskOut, 0, blockMaskOut.Length);
+
+        if (Mode != KeyboardProfileMode.Blacklist)
+        {
+            return;
+        }
+
+        foreach (var key in _keys)
+        {
+            if (key >= 0 && key < SharedMemoryConstants.KeyCount)
+            {
+                blockMaskOut[key] = 1;
+            }
+        }
+    }
+
+    /// <summary>
     /// 按方案生成键盘状态与边沿计数快照。
     /// </summary>
     public void Apply(bool[] down, uint[] edgeCounter, byte[] toggleState, byte[] keyboardState, uint[] edgeOut, byte[] maskOut)
